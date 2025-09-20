@@ -1,0 +1,1141 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ASR Service — Minimal Frontend</title>
+    <style>
+        :root {
+            --bg: #0b0f14;
+            --panel: rgba(255, 255, 255, 0.07);
+            --panel-2: rgba(255, 255, 255, 0.05);
+            --accent: #66e0ff;
+            --accent-2: #a8ff60;
+            --text: #e8f1f8;
+            --muted: #a9b6c3;
+            --danger: #ff6b6b;
+            --ok: #7dffb0;
+            --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            --radius: 16px;
+            --shadow: 0 10px 30px rgba(0, 0, 0, .35), inset 0 0 1px rgba(255, 255, 255, .12);
+        }
+
+        * {
+            box-sizing: border-box
+        }
+
+        html,
+        body {
+            height: 100%
+        }
+
+        body {
+            margin: 0;
+            color: var(--text);
+            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Ubuntu, Cantarell, Helvetica Neue, Arial;
+            line-height: 1.3;
+        }
+
+        body::after {
+            content: '';
+            z-index: -1;
+            top: 0;
+            position: fixed;
+            width: 100vw;
+            height: 100vh;
+            background:
+                radial-gradient(1200px 800px at 10% -10%, #163147, transparent 60%),
+                radial-gradient(900px 600px at 100% 0%, #1b2d18, transparent 55%),
+                var(--bg);
+        }
+
+        header {
+            padding: 24px 20px;
+            display: flex;
+            gap: 18px;
+            align-items: center;
+            justify-content: space-between
+        }
+
+        .brand {
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            letter-spacing: .4px
+        }
+
+        .logo {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            background: conic-gradient(from 220deg, var(--accent), #9f78ff, var(--accent-2));
+            box-shadow: var(--shadow)
+        }
+
+        .brand h1 {
+            font-size: 18px;
+            margin: 0;
+            font-weight: 700
+        }
+
+        .hint {
+            color: var(--muted);
+            font-size: 12px
+        }
+
+        .grid {
+            display: grid;
+            gap: 16px;
+            padding: 0 20px 24px;
+            grid-template-columns: repeat(12, 1fr)
+        }
+
+        .card {
+            grid-column: span 12;
+            background: var(--panel);
+            border: 1px solid rgba(255, 255, 255, .08);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(8px);
+            padding: 16px
+        }
+
+        @media (min-width:980px) {
+            .span-6 {
+                grid-column: span 6
+            }
+
+            .span-4 {
+                grid-column: span 4
+            }
+
+            .span-8 {
+                grid-column: span 8
+            }
+        }
+
+        .card h2 {
+            margin: 0 0 8px;
+            font-size: 16px
+        }
+
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center
+        }
+
+        .row>* {
+            margin: 2px 0
+        }
+
+        label {
+            font-size: 12px;
+            color: var(--muted);
+            margin-right: 6px
+        }
+
+        input[type="text"],
+        input[type="url"],
+        input[type="number"],
+        input[type="file"],
+        #modelName,
+        textarea,
+        select {
+            width: 100%;
+            background: var(--panel-2);
+            color: var(--text);
+            border: 1px solid rgba(255, 255, 255, .15);
+            padding: 10px 12px;
+            border-radius: 12px;
+            outline: none;
+            font-size: 14px
+        }
+
+        input::placeholder,
+        textarea::placeholder {
+            color: #90a4b5;
+            opacity: .75
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 84px
+        }
+
+        input[type="file" i]::file-selector-button,
+        button {
+            background: linear-gradient(180deg, rgba(102, 224, 255, .9), rgba(102, 224, 255, .6));
+            color: #001018;
+            border: 0;
+            padding: 10px 14px;
+            font-weight: 700;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: .15s transform ease, .15s filter ease;
+            box-shadow: 0 6px 16px rgba(72, 218, 255, .25), inset 0 0 1px rgba(255, 255, 255, .6)
+        }
+
+        button.secondary {
+            background: linear-gradient(180deg, rgba(168, 255, 96, .9), rgba(168, 255, 96, .6));
+            color: #021204;
+            box-shadow: 0 6px 16px rgba(168, 255, 96, .20), inset 0 0 1px rgba(255, 255, 255, .6)
+        }
+
+        button.ghost {
+            background: transparent;
+            color: var(--text);
+            border: 1px solid rgba(255, 255, 255, .2)
+        }
+
+        button.danger {
+            background: linear-gradient(180deg, rgba(255, 107, 107, .95), rgba(255, 107, 107, .7));
+            color: #280a0a;
+            box-shadow: 0 6px 16px rgba(255, 107, 107, .25), inset 0 0 1px rgba(255, 255, 255, .6)
+        }
+
+        button:active {
+            transform: translateY(1px)
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, .15);
+            background: rgba(255, 255, 255, .05)
+        }
+
+        .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #999
+        }
+
+        .dot.ok {
+            background: var(--ok);
+            box-shadow: 0 0 12px var(--ok)
+        }
+
+        .dot.warn {
+            background: #f9c846;
+            box-shadow: 0 0 12px #f9c846
+        }
+
+        .dot.err {
+            background: var(--danger);
+            box-shadow: 0 0 12px var(--danger)
+        }
+
+        .code {
+            background: #04070b;
+            border: 1px solid rgba(255, 255, 255, .12);
+            border-radius: 12px;
+            padding: 12px;
+            font-family: var(--mono);
+            font-size: 12px;
+            white-space: pre-wrap;
+            color: #d7f0ff;
+            max-height: 260px;
+            overflow: auto
+        }
+
+        .muted {
+            color: var(--muted);
+            font-size: 12px
+        }
+
+        .kv {
+            display: grid;
+            grid-template-columns: 160px 1fr;
+            gap: 10px
+        }
+
+        hr.sep {
+            border: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .12), transparent);
+            margin: 12px 0
+        }
+
+        .pill {
+            font-family: var(--mono);
+            font-size: 12px;
+            color: #03131a;
+            background: var(--accent);
+            border-radius: 999px;
+            padding: 4px 8px;
+            text-decoration: none
+        }
+
+        .tiny {
+            font-size: 11px
+        }
+
+        /* Transcript boxes */
+        .bubble {
+            background: rgba(255, 255, 255, .06);
+            border: 1px solid rgba(255, 255, 255, .12);
+            padding: 10px;
+            border-radius: 12px;
+        }
+
+        .col-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 260px;
+            overflow: auto
+        }
+
+        .vu {
+            height: 8px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, .08);
+            border: 1px solid rgba(255, 255, 255, .15);
+            overflow: hidden
+        }
+
+        .vu>b {
+            display: block;
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #22c55e, #eab308, #ef4444)
+        }
+    </style>
+
+    <!-- nkn-sdk pinned (browser build) -->
+    <script src="https://cdn.jsdelivr.net/npm/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+</head>
+
+<body>
+    <header>
+        <div class="brand">
+            <div class="logo"></div>
+            <div>
+                <h1>ASR Service Playground</h1>
+                <div class="hint">Whisper-backed recognition · File or Live Stream · HTTP or NKN Relay</div>
+            </div>
+        </div>
+        <div id="status" class="badge"><span class="dot warn"></span><span>Checking…</span></div>
+    </header>
+
+    <main class="grid">
+
+        <!-- SETTINGS -->
+        <section class="card span-6">
+            <h2>Settings</h2>
+            <div class="kv">
+                <label for="transport">Transport</label>
+                <select id="transport">
+                    <option value="http">HTTP(S) Direct</option>
+                    <option value="nkn">NKN Relay (DM)</option>
+                </select>
+
+                <label for="baseUrl">Base URL</label>
+                <input id="baseUrl" type="url" placeholder="http://localhost:8126" />
+
+                <label for="relayAddr">NKN Relay Address</label>
+                <input id="relayAddr" type="text" placeholder="(paste full NKN address incl. identifier)" />
+
+                <label for="apiKey">API Key</label>
+                <input id="apiKey" type="text" placeholder="(optional, if server requires auth)" />
+
+                <div></div>
+                <div class="row">
+                    <button id="saveSettings">Save</button>
+                    <button class="secondary" id="handshakeBtn">Handshake → Session</button>
+                    <button class="ghost" id="clearSession">Clear Session</button>
+                </div>
+            </div>
+
+            <div class="row" style="margin-top:10px;">
+                <span class="muted">NKN: <span id="nknInfo">disconnected</span></span>
+                <div class="row" style="margin-left:auto;">
+                    <button id="nknConnectBtn">Connect NKN</button>
+                    <button class="ghost" id="nknDisconnectBtn">Disconnect</button>
+                </div>
+            </div>
+
+            <hr class="sep">
+            <div class="row">
+                <button id="checkHealth">Check Health</button>
+                <button class="secondary" id="loadModels">Load Models</button>
+                <span class="muted">Session: <span id="sessInfo">none</span></span>
+            </div>
+            <div id="healthBox" class="code" style="margin-top:8px; display:none;"></div>
+            <div class="tiny muted" style="margin-top:6px;">
+                Tip: With NKN Relay, Base URL must be correct from the relay host’s perspective (e.g.
+                <code>http://127.0.0.1:8126</code> if relay runs beside the service).
+            </div>
+        </section>
+
+        <!-- MODELS -->
+        <section class="card span-6">
+            <h2>Models</h2>
+            <div class="row" style="margin-bottom:8px;">
+                <label for="modelName">Use Model</label>
+                <input id="modelName" list="modelList" placeholder="base · small · medium · large-v3 (optional)" />
+                <datalist id="modelList"></datalist>
+            </div>
+            <div id="modelsBox" class="code" style="margin-top:8px; display:none;"></div>
+        </section>
+
+        <!-- FILE TRANSCRIPTION -->
+        <section class="card span-6">
+            <h2>Transcribe Audio File</h2>
+            <div class="kv">
+                <label>file</label>
+                <input id="fileInput" type="file" accept="audio/*,.wav,.flac,.mp3,.m4a,.ogg,.opus" />
+
+                <label>format</label>
+                <select id="fileFormat">
+                    <option value="auto" selected>auto</option>
+                    <option value="wav">wav</option>
+                    <option value="flac">flac</option>
+                    <option value="mp3">mp3</option>
+                    <option value="m4a">m4a/aac</option>
+                    <option value="ogg">ogg</option>
+                    <option value="opus">opus</option>
+                    <option value="pcm16">pcm16 (raw, little-endian)</option>
+                </select>
+
+                <label>sample rate</label>
+                <input id="fileSr" type="number" placeholder="auto/16000" />
+
+                <div></div>
+                <div class="row">
+                    <button id="fileGo">Transcribe</button>
+                    <span class="muted">Returns structured JSON with transcript + segments.</span>
+                </div>
+            </div>
+            <div id="fileOut" style="margin-top:10px;">
+                <div class="row">
+                    <span class="muted">Text</span>
+                    <div id="fileText" class="bubble" style="flex:1 1 auto; min-height:40px;"></div>
+                </div>
+                <div id="fileJson" class="code" style="margin-top:8px; display:none;"></div>
+                <div id="fileLog" class="code" style="margin-top:8px; display:none;"></div>
+            </div>
+        </section>
+
+        <!-- LIVE STREAM -->
+        <section class="card span-6">
+            <h2>Live Mic → ASR</h2>
+            <div class="kv">
+                <label>target rate</label>
+                <select id="targetRate">
+                    <option value="16000" selected>16,000 Hz</option>
+                    <option value="22050">22,050 Hz</option>
+                    <option value="24000">24,000 Hz</option>
+                </select>
+
+                <label>stream chunk</label>
+                <select id="chunkMs">
+                    <option value="80">80 ms</option>
+                    <option value="120" selected>120 ms</option>
+                    <option value="160">160 ms</option>
+                    <option value="200">200 ms</option>
+                </select>
+
+                <div></div>
+                <div class="row">
+                    <button id="streamStart">Start</button>
+                    <button class="danger" id="streamStop">Stop</button>
+                    <span class="muted">Mic → PCM16LE → /recognize/stream/*</span>
+                </div>
+            </div>
+
+            <div class="row" style="margin-top:8px;">
+                <div class="vu" style="flex:1"><b id="vuBar"></b></div>
+                <span class="muted">buf: <span id="bufInfo">0</span></span>
+                <span class="muted">out: <span id="outInfo">0</span></span>
+            </div>
+
+            <div class="row" style="margin-top:10px;">
+                <div style="flex:1">
+                    <div class="muted">Partial</div>
+                    <div id="livePartial" class="bubble" style="min-height:40px;"></div>
+                </div>
+                <div style="flex:1">
+                    <div class="muted">Final</div>
+                    <div id="finalList" class="col-list bubble"></div>
+                </div>
+            </div>
+            <div id="streamLog" class="code" style="margin-top:8px; display:none;"></div>
+        </section>
+
+        <!-- EXAMPLES -->
+        <section class="card span-12">
+            <h2>Quick Examples</h2>
+            <div class="row" style="flex-wrap:wrap">
+                <button class="ghost" data-example="file-short">File → Transcribe</button>
+                <button class="ghost" data-example="stream-start">Start Live Stream</button>
+                <button class="ghost" data-example="stream-stop">Stop Stream</button>
+            </div>
+            <div class="code" style="margin-top:8px;">
+                # File (HTTP) — raw bytes
+                curl -X POST "$BASE/recognize?format=wav&sr=16000" \
+                -H "Content-Type: application/octet-stream" --data-binary @sample.wav
+            </div>
+        </section>
+    </main>
+
+    <script>
+        /* ======================== STATE ======================== */
+        const S = {
+            transport: localStorage.getItem('asr.transport') || 'http', // 'http' | 'nkn'
+            base: localStorage.getItem('asr.base') || 'http://localhost:8126',
+            relayAddr: localStorage.getItem('asr.relayAddr') || '',
+            apiKey: localStorage.getItem('asr.apiKey') || '',
+            sessionKey: localStorage.getItem('asr.sessionKey') || '',
+            sessionExp: parseInt(localStorage.getItem('asr.sessionExp') || '0', 10),
+
+            // NKN runtime (same shape as TTS frontend)
+            nkn: {
+                client: null,
+                addr: '',
+                ready: false,
+                pending: new Map(), // single-response
+                streams: new Map(), // id -> ctx
+                nextId: 1,
+                readyCbs: [],
+                _want: false,
+                _reconnectTimer: null,
+                _backoffMs: 800,
+                _backoffMax: 15000,
+                lastRxMs: 0,
+                lastTxMs: 0,
+                _watchdogTimer: null,
+                _awaitingPong: false,
+            },
+
+            // Models refresh
+            _models: [],
+            _modelsTimer: null,
+            _modelsLastOk: 0,
+            _modelsIntervalMs: 30000,
+            _modelsSlowMs: 180000,
+
+            // Mic streaming
+            running: false,
+            ac: null,
+            node: null,
+            media: null,
+            source: null,
+            targetRate: 16000,
+            chunkMs: 120,
+            bufF32: new Float32Array(0),
+            outstanding: 0,
+            maxOutstanding: 4,
+            vuAvg: 0,
+            sid: null,
+            evtAbort: null,
+        };
+
+        /* ======================== HELPERS ======================== */
+        const qs = id => document.getElementById(id);
+        const j = x => JSON.stringify(x, null, 2);
+        const now = () => Math.floor(Date.now() / 1000);
+        function toast(txt, ok = true) {
+            const st = qs('status');
+            st.innerHTML = `<span class="dot ${ok ? 'ok' : 'err'}"></span><span>${txt}</span>`;
+            setTimeout(() => { st.innerHTML = `<span class="dot ok"></span><span>Ready</span>`; }, 1600);
+        }
+        function updateSessInfo() {
+            const si = qs('sessInfo');
+            if (S.sessionKey && S.sessionExp && S.sessionExp > now()) {
+                si.textContent = `bearer • ${S.sessionExp - now()}s`;
+            } else si.textContent = 'none';
+        }
+        function reflectTransportUI() {
+            const nknInfo = qs('nknInfo');
+            if (S.transport === 'nkn') {
+                nknInfo.textContent = S.nkn.ready ? `connected • ${String(S.nkn.addr || '').slice(0, 10)}…` : 'connecting…';
+            } else nknInfo.textContent = 'disabled';
+        }
+        function authHeaders(h = {}) {
+            const headers = Object.assign({ 'Content-Type': 'application/json' }, h);
+            const fresh = S.sessionKey && S.sessionExp && S.sessionExp > now();
+            if (fresh) headers['Authorization'] = `Bearer ${S.sessionKey}`;
+            else if (S.apiKey) headers['X-API-Key'] = S.apiKey;
+            return headers;
+        }
+        function authOnlyHeaders(h = {}) {
+            const out = { ...h };
+            const fresh = S.sessionKey && S.sessionExp && S.sessionExp > now();
+            if (fresh) out['Authorization'] = `Bearer ${S.sessionKey}`;
+            else if (S.apiKey) out['X-API-Key'] = S.apiKey;
+            return out;
+        }
+        function b64ToBytes(b64) { const bin = atob(b64); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i); return u8; }
+
+        /* ======================== SSE DECODER ======================== */
+        function createSSEDecoder(onEvent) {
+            let buf = '';
+            return (bytes) => {
+                const txt = new TextDecoder('utf-8').decode(bytes); buf += txt;
+                let idx;
+                while ((idx = buf.indexOf('\n\n')) >= 0) {
+                    const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+                    let ev = null, data = '';
+                    for (const line of chunk.split(/\r?\n/)) {
+                        if (!line) continue;
+                        if (line.startsWith(':')) continue;
+                        if (line.startsWith('event:')) ev = line.slice(6).trim();
+                        else if (line.startsWith('data:')) data += (data ? '\n' : '') + line.slice(5).trim();
+                    }
+                    if (data) { try { onEvent(ev || 'message', data); } catch { } }
+                }
+            };
+        }
+
+        /* ======================== HTTP HELPERS ======================== */
+        async function getJSON(path, extraHeaders) {
+            if (S.transport === 'nkn') return nknFetchJSON(path, 'GET', null, authHeaders(extraHeaders || {}));
+            const res = await fetch(S.base.replace(/\/+$/, '') + path, { headers: authHeaders(extraHeaders) });
+            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            return res.json();
+        }
+        async function postJSON(path, body, timeoutMs) {
+            if (S.transport === 'nkn') return nknFetchJSON(path, 'POST', body || {}, authHeaders({}), timeoutMs);
+            const ctrl = timeoutMs ? new AbortController() : null;
+            const t = timeoutMs ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+            try {
+                const res = await fetch(S.base.replace(/\/+$/, '') + path, {
+                    method: 'POST', headers: authHeaders({}), body: JSON.stringify(body || {}), signal: ctrl ? ctrl.signal : undefined
+                });
+                if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+                return res.json();
+            } finally { if (t) clearTimeout(t); }
+        }
+        async function postBytes(fullUrl, bytes, extraHeaders, timeoutMs) {
+            if (S.transport === 'nkn') {
+                const req = {
+                    url: fullUrl,
+                    method: 'POST',
+                    headers: authHeaders(Object.assign({ 'Content-Type': 'application/octet-stream' }, extraHeaders || {})),
+                    body_b64: btoa(Array.from(bytes).map(x => String.fromCharCode(x)).join('')),
+                    timeout_ms: timeoutMs || 45000
+                };
+                const resp = await nknSendRelay(req, req.timeout_ms);
+                if (!resp || resp.ok === false) throw new Error((resp && resp.error) || ('HTTP ' + (resp && resp.status)));
+                return (resp.json !== undefined && resp.json !== null) ? resp.json : null;
+            } else {
+                const ctrl = timeoutMs ? new AbortController() : null;
+                const t = timeoutMs ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+                try {
+                    const res = await fetch(fullUrl, {
+                        method: 'POST',
+                        headers: authHeaders(Object.assign({ 'Content-Type': 'application/octet-stream' }, extraHeaders || {})),
+                        body: bytes, signal: ctrl ? ctrl.signal : undefined
+                    });
+                    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+                    return res.json().catch(() => null);
+                } finally { if (t) clearTimeout(t); }
+            }
+        }
+
+        /* ======================== NKN RELAY ======================== */
+        function nknDisconnect() {
+            try { S.nkn.client && S.nkn.client.close(); } catch { }
+            S.nkn.client = null; S.nkn.ready = false; S.nkn.addr = '';
+            clearInterval(S.nkn._watchdogTimer); S.nkn._watchdogTimer = null;
+            clearTimeout(S.nkn._reconnectTimer); S.nkn._reconnectTimer = null;
+            reflectTransportUI();
+        }
+        function nknScheduleReconnect(force) {
+            if (S.transport !== 'nkn') return;
+            if (!S.nkn._want && !force) return;
+            clearTimeout(S.nkn._reconnectTimer);
+            const d = force ? 0 : S.nkn._backoffMs;
+            S.nkn._reconnectTimer = setTimeout(() => nknEnsureClient(true), d);
+            if (!force) S.nkn._backoffMs = Math.min(S.nkn._backoffMs * 2, S.nkn._backoffMax);
+        }
+        function nknStartWatchdog() {
+            clearInterval(S.nkn._watchdogTimer);
+            if (S.transport !== 'nkn' || !S.relayAddr || !S.nkn.client) return;
+            const STALE_MS = 30000, PONG_MS = 7000;
+            S.nkn._watchdogTimer = setInterval(async () => {
+                const c = S.nkn.client; if (!c) return;
+                const nowMs = Date.now();
+                if (S.nkn._awaitingPong && (nowMs - S.nkn.lastTxMs > PONG_MS)) {
+                    S.nkn._awaitingPong = false; nknDisconnect(); nknScheduleReconnect(true); return;
+                }
+                if (nowMs - (S.nkn.lastRxMs || 0) > STALE_MS && !S.nkn._awaitingPong) {
+                    try {
+                        S.nkn._awaitingPong = true; S.nkn.lastTxMs = nowMs;
+                        await c.send(S.relayAddr, JSON.stringify({ event: 'relay.ping', ts: nowMs }), { noReply: true, maxHoldingSeconds: 120 });
+                    } catch {
+                        nknDisconnect(); nknScheduleReconnect(true);
+                    }
+                }
+            }, 5000);
+        }
+        function nknEnsureClient(recycle = false) {
+            if (S.transport !== 'nkn') return;
+            S.nkn._want = true;
+            if (!window.nkn || !(window.nkn.MultiClient || window.nkn.Client)) { toast('nkn-sdk not loaded', false); return; }
+            if (!recycle && S.nkn.client) return;
+            if (recycle && S.nkn.client) { try { S.nkn.client.close(); } catch { } S.nkn.client = null; }
+
+            const client = new nkn.MultiClient({ identifier: 'asr-webui', numSubClients: 4, wsConnHeartbeatTimeout: 60000 });
+            S.nkn.client = client;
+
+            client.on('connect', () => {
+                S.nkn.addr = client.addr || ''; S.nkn.ready = true; S.nkn._backoffMs = 800;
+                S.nkn.lastRxMs = Date.now(); S.nkn._awaitingPong = false;
+                (S.nkn.readyCbs || []).forEach(fn => { try { fn() } catch { } }); S.nkn.readyCbs.length = 0;
+                reflectTransportUI(); toast('NKN connected'); doHealth().catch(() => { });
+                ensureModelsLoop(true); nknStartWatchdog();
+            });
+
+            client.on('message', (a, b) => {
+                let src, payload; if (a && typeof a === 'object' && a.payload !== undefined) { src = a.src; payload = a.payload; } else { src = a; payload = b; }
+                try {
+                    const txt = (payload && payload.toString) ? payload.toString() : ('' + payload);
+                    const msg = JSON.parse(txt); const ev = msg && msg.event || ''; const id = msg && msg.id;
+                    S.nkn.lastRxMs = Date.now();
+                    if (ev === 'relay.pong') { S.nkn._awaitingPong = false; return; }
+                    if (/^relay\.response\.(begin|chunk|end|keepalive)$/.test(ev) && id) {
+                        const ctx = S.nkn.streams.get(id); if (!ctx) return;
+                        function init() { if (ctx.__init) return; ctx.__init = true; ctx.expected = 1; ctx.pending = new Map(); ctx.ended = false; ctx.lastSeq = null; ctx.endTimer = null; }
+                        function finalize() { if (ctx.__done) return; ctx.__done = true; clearTimeout(ctx.endTimer); try { ctx.onEnd && ctx.onEnd(ctx._endMsg || { ok: true }); } catch { } if (ctx._endOk === false) ctx.onReject && ctx.onReject(new Error(ctx._endErr || 'stream error')); else ctx.onResolve && ctx.onResolve(ctx._endMsg || { ok: true }); S.nkn.streams.delete(id); }
+                        function flush() { while (ctx.pending.has(ctx.expected)) { const bytes = ctx.pending.get(ctx.expected); ctx.pending.delete(ctx.expected); try { ctx.onChunk && ctx.onChunk(bytes, ctx.expected); } catch { } ctx.expected++; } if (ctx.ended && ctx.lastSeq != null && ctx.expected > ctx.lastSeq && ctx.pending.size === 0) finalize(); }
+                        if (ev === 'relay.response.begin') { init(); try { ctx.onBegin && ctx.onBegin(msg); } catch { } return; }
+                        if (ev === 'relay.response.chunk') { init(); const seq = msg.seq | 0; const bytes = b64ToBytes(msg.b64 || ''); if (seq === ctx.expected) { try { ctx.onChunk && ctx.onChunk(bytes, seq); } catch { } ctx.expected++; flush(); } else if (seq > ctx.expected) { ctx.pending.set(seq, bytes); } return; }
+                        if (ev === 'relay.response.end') { init(); ctx._endMsg = msg; ctx._endOk = (msg.ok !== false); ctx._endErr = msg.error || null; ctx.ended = true; const ls = (typeof msg.last_seq === 'number' && msg.last_seq >= 0) ? msg.last_seq : (ctx.expected - 1); ctx.lastSeq = ls; flush(); if (!ctx.__done) { clearTimeout(ctx.endTimer); ctx.endTimer = setTimeout(() => { flush(); finalize(); }, 1200); } return; }
+                        return;
+                    }
+                    if (ev === 'relay.response' && id) { const p = S.nkn.pending.get(id); if (p) { clearTimeout(p.timer); S.nkn.pending.delete(id); p.resolve(msg); } }
+                } catch { }
+            });
+
+            client.on('close', () => { S.nkn.ready = false; reflectTransportUI(); nknScheduleReconnect(false); });
+        }
+        function nknWaitReady(timeoutMs = 20000) {
+            return new Promise((resolve, reject) => {
+                if (S.nkn.ready) return resolve();
+                nknEnsureClient();
+                const t = setTimeout(() => { cleanup(); reject(new Error('NKN connect timeout')); }, timeoutMs);
+                function onReady() { cleanup(); resolve(); }
+                function cleanup() { clearTimeout(t); S.nkn.readyCbs = (S.nkn.readyCbs || []).filter(fn => fn !== onReady); }
+                (S.nkn.readyCbs = S.nkn.readyCbs || []).push(onReady);
+            });
+        }
+        async function nknSendRelay(reqSpec, timeoutMs = 45000) {
+            if (!S.relayAddr) throw new Error('No relay address set');
+            await nknWaitReady();
+            const client = S.nkn.client;
+            const id = 'web-' + Date.now() + '-' + (S.nkn.nextId++);
+            const data = { event: 'http.request', id, req: reqSpec };
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => { S.nkn.pending.delete(id); reject(new Error('NKN relay timeout')); }, timeoutMs);
+                S.nkn.pending.set(id, { resolve, reject, timer });
+                S.nkn.lastTxMs = Date.now();
+                client.send(S.relayAddr, JSON.stringify(data), { noReply: true, maxHoldingSeconds: 120 })
+                    .catch(err => { clearTimeout(timer); S.nkn.pending.delete(id); reject(err); });
+            });
+        }
+        async function nknSendRelayStream(reqSpec, handlers = {}, timeoutMs = 300000) {
+            if (!S.relayAddr) throw new Error('No relay address set');
+            await nknWaitReady();
+            const client = S.nkn.client;
+            const id = 'web-' + Date.now() + '-' + (S.nkn.nextId++);
+            const ctx = { onBegin: handlers.onBegin || null, onChunk: handlers.onChunk || null, onEnd: handlers.onEnd || null, onResolve: null, onReject: null };
+            const p = new Promise((resolve, reject) => { ctx.onResolve = (m) => { try { handlers.onEnd && handlers.onEnd(m); } catch { } resolve(m); }; ctx.onReject = (e) => reject(e); });
+            S.nkn.streams.set(id, ctx);
+            const data = { event: 'http.request', id, req: Object.assign({ stream: 'chunks' }, reqSpec) };
+            const timer = setTimeout(() => { if (S.nkn.streams.has(id)) { S.nkn.streams.delete(id); ctx.onReject && ctx.onReject(new Error('NKN stream timeout')); } }, timeoutMs);
+            p.finally(() => clearTimeout(timer));
+            S.nkn.lastTxMs = Date.now();
+            await client.send(S.relayAddr, JSON.stringify(data), { noReply: true, maxHoldingSeconds: 120 });
+            return p;
+        }
+        async function nknFetchJSON(path, method = 'GET', bodyObj = null, headers = {}, timeoutMs = 45000) {
+            const req = { url: S.base.replace(/\/+$/, '') + path, method, headers, timeout_ms: timeoutMs };
+            if (bodyObj !== null) req.json = bodyObj;
+            const resp = await nknSendRelay(req, req.timeout_ms);
+            if (!resp || resp.ok === false) throw new Error((resp && resp.error) || ('HTTP ' + (resp && resp.status)));
+            if (resp.json !== null && resp.json !== undefined) return resp.json;
+            if (resp.body_b64) {
+                const bytes = b64ToBytes(resp.body_b64);
+                const txt = new TextDecoder('utf-8').decode(bytes);
+                return JSON.parse(txt);
+            }
+            return null;
+        }
+
+        /* ======================== HEALTH & MODELS ======================== */
+        async function doHealth() {
+            try {
+                const data = await getJSON('/health');
+                const hb = qs('healthBox'); hb.style.display = 'block'; hb.textContent = j(data);
+                const ok = (data && (data.status === 'ok' || data.ok === true));
+                qs('status').innerHTML = `<span class="dot ${ok ? 'ok' : 'warn'}"></span><span>${ok ? 'Service OK' : 'Service Degraded'}</span>`;
+            } catch (e) {
+                const hb = qs('healthBox'); hb.style.display = 'block'; hb.textContent = 'Error: ' + e.message;
+                toast('Health error', false);
+            }
+        }
+        async function doModels() {
+            try {
+                const data = await getJSON('/models');
+                const mb = qs('modelsBox'); mb.style.display = 'block'; mb.textContent = j(data);
+                const dl = qs('modelList'); dl.innerHTML = '';
+                (data.models || []).forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.name || m.model || '';
+                    dl.appendChild(opt);
+                });
+                S._models = (data.models || []).map(m => m.name || m.model).filter(Boolean);
+                S._modelsLastOk = Date.now();
+                toast('Loaded models');
+            } catch (e) {
+                const mb = qs('modelsBox'); mb.style.display = 'block'; mb.textContent = 'Error: ' + e.message;
+                toast('Models error', false);
+            }
+        }
+        function ensureModelsLoop(kick = false) {
+            clearTimeout(S._modelsTimer);
+            const haveSome = Array.isArray(S._models) && S._models.length > 0;
+            const stale = !S._modelsLastOk || (Date.now() - S._modelsLastOk > S._modelsSlowMs);
+            if (kick || !haveSome || stale) doModels().catch(() => { });
+            S._modelsTimer = setTimeout(() => ensureModelsLoop(false), haveSome ? S._modelsSlowMs : S._modelsIntervalMs);
+        }
+
+        /* ======================== AUTH ======================== */
+        async function doHandshake() {
+            if (!S.apiKey && !(S.sessionKey && S.sessionExp > now())) { toast('Enter API key first', false); return; }
+            try {
+                const data = await postJSON('/handshake', { api_key: S.apiKey });
+                S.sessionKey = data.session_key; S.sessionExp = now() + (data.expires_in | 0);
+                localStorage.setItem('asr.sessionKey', S.sessionKey);
+                localStorage.setItem('asr.sessionExp', String(S.sessionExp));
+                updateSessInfo(); toast('Session established');
+            } catch (e) { toast('Handshake failed', false); }
+        }
+        function clearSession() {
+            S.sessionKey = ''; S.sessionExp = 0;
+            localStorage.removeItem('asr.sessionKey'); localStorage.removeItem('asr.sessionExp');
+            updateSessInfo(); toast('Session cleared');
+        }
+
+        /* ======================== FILE TRANSCRIPTION ======================== */
+        function guessFormat(file) {
+            const t = (file.type || '').toLowerCase();
+            if (t.includes('wav')) return 'wav';
+            if (t.includes('flac')) return 'flac';
+            if (t.includes('mp3')) return 'mp3';
+            if (t.includes('ogg')) return 'ogg';
+            if (t.includes('opus')) return 'opus';
+            if (t.includes('m4a') || t.includes('aac')) return 'm4a';
+            return 'auto';
+        }
+        async function doFile() {
+            const fin = qs('fileInput');
+            const fmtSel = qs('fileFormat');
+            const sr = parseInt(qs('fileSr').value || '0', 10) || 0;
+            const model = (qs('modelName').value || '').trim();
+
+            if (!fin || !fin.files || !fin.files.length) {
+                toast('Choose a file', false);
+                return;
+            }
+            const file = fin.files[0];
+
+            const fileText = qs('fileText');
+            const fileJson = qs('fileJson');
+            const log = qs('fileLog');
+            fileText.textContent = '';
+            fileJson.style.display = 'none';
+            fileJson.textContent = '';
+            log.style.display = 'block';
+            log.textContent = '(uploading)…';
+
+            try {
+                let data;
+
+                if (S.transport === 'http') {
+                    // ---- HTTP: send multipart/form-data with file=<blob>
+                    const fd = new FormData();
+                    fd.append('file', file, file.name);
+                    // (format/sample_rate are not needed for multipart; server decodes)
+                    // If you want to hint, you *could* add query params, but not required.
+                    const res = await fetch(S.base.replace(/\/+$/, '') + '/recognize', {
+                        method: 'POST',
+                        headers: authOnlyHeaders(), // IMPORTANT: do not set Content-Type manually
+                        body: fd,
+                    });
+                    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+                    data = await res.json();
+                } else {
+                    // ---- NKN: send JSON {body_b64, format, sample_rate}
+                    const buf = new Uint8Array(await file.arrayBuffer());
+                    const body_b64 = btoa(Array.from(buf).map(x => String.fromCharCode(x)).join(''));
+
+                    // "auto" -> let backend decide (send no format)
+                    const format = fmtSel.value === 'auto' ? undefined : fmtSel.value || undefined;
+                    const sample_rate = sr || undefined;
+
+                    const payload = { body_b64, ...(format ? { format } : {}), ...(sample_rate ? { sample_rate } : {}) };
+                    // model is ignored by /recognize; full model is configured server-side
+                    data = await nknFetchJSON('/recognize', 'POST', payload, authHeaders({}), 10 * 60 * 1000);
+                }
+
+                log.textContent = j(data);
+                const text = (data && (data.text || data.transcript || '')) || '';
+                fileText.textContent = text;
+                fileJson.style.display = 'block';
+                fileJson.textContent = j(data);
+                toast('Transcribed');
+            } catch (e) {
+                log.textContent = 'Error: ' + e.message;
+                toast('Transcription failed', false);
+            }
+        }
+
+
+        /* ======================== MIC STREAMING ======================== */
+        function int16FromF32(f32) {
+            const out = new Int16Array(f32.length);
+            for (let i = 0; i < f32.length; i++) {
+                const v = Math.max(-1, Math.min(1, f32[i]));
+                out[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
+            }
+            return new Uint8Array(out.buffer);
+        }
+        function resampleLinearF32(input, fromRate, toRate) {
+            if (fromRate === toRate) return input.slice(0);
+            const ratio = toRate / fromRate; const newLen = Math.round(input.length * ratio);
+            const out = new Float32Array(newLen);
+            for (let i = 0; i < newLen; i++) {
+                const pos = i / ratio; const i0 = Math.floor(pos); const i1 = Math.min(i0 + 1, input.length - 1);
+                const frac = pos - i0; out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+            }
+            return out;
+        }
+        function pushF32(f32) {
+            const a = S.bufF32; const b = f32;
+            const out = new Float32Array(a.length + b.length); out.set(a, 0); out.set(b, a.length);
+            S.bufF32 = out; qs('bufInfo').textContent = String(S.bufF32.length);
+        }
+        function drainF32(n) {
+            const a = S.bufF32; const take = Math.min(a.length, n);
+            const head = a.subarray(0, take); S.bufF32 = a.subarray(take).slice(0);
+            qs('bufInfo').textContent = String(S.bufF32.length);
+            return head;
+        }
+        function setVU(rms) {
+            const pct = Math.max(0, Math.min(100, rms * 400)); qs('vuBar').style.width = pct.toFixed(1) + '%';
+        }
+
+        async function startStream() {
+            if (S.running) return;
+            // start session on server
+            const model = (qs('modelName').value || '').trim() || undefined;
+            S.targetRate = parseInt(qs('targetRate').value || '16000', 10) || 16000;
+            S.chunkMs = parseInt(qs('chunkMs').value || '120', 10) || 120;
+            try {
+                const resp = await postJSON('/recognize/stream/start', { model });
+                S.sid = (resp && (resp.sid || resp.id || resp.session)) || null;
+                if (!S.sid) throw new Error('No sid from server');
+            } catch (e) { toast('Start failed: ' + e.message, false); return; }
+
+            // attach events SSE for partial/final
+            openEvents(S.sid, S.transport === 'nkn').catch(() => { });
+
+            // WebAudio
+            const ac = S.ac = new (window.AudioContext || window.webkitAudioContext)();
+            const media = S.media = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false });
+            S.source = ac.createMediaStreamSource(media);
+            S.node = (ac.createScriptProcessor ? ac.createScriptProcessor(2048, 1, 1) : new ScriptProcessorNode(ac, { bufferSize: 2048, numberOfInputs: 1, numberOfOutputs: 1 }));
+            const fromRate = ac.sampleRate;
+
+            S.node.onaudioprocess = (e) => {
+                const ch0 = e.inputBuffer.getChannelData(0);
+                let sum = 0; for (let i = 0; i < ch0.length; i++) sum += ch0[i] * ch0[i];
+                setVU(Math.sqrt(sum / ch0.length));
+                const f32 = (fromRate === S.targetRate) ? ch0.slice(0) : resampleLinearF32(ch0, fromRate, S.targetRate);
+                pushF32(f32);
+            };
+            S.source.connect(S.node); S.node.connect(ac.destination);
+
+            S.running = true; flushLoop().catch(() => { });
+            toast('Streaming…');
+        }
+        async function stopStream() {
+            if (!S.running) return;
+            S.running = false;
+            try { S.node && S.node.disconnect(); } catch { } try { S.source && S.source.disconnect(); } catch { }
+            try { S.media && S.media.getTracks().forEach(t => t.stop()); } catch { }
+            try { S.ac && S.ac.close(); } catch { }
+            S.node = S.source = S.media = S.ac = null;
+            try {
+                if (S.sid) {
+                    await postJSON(`/recognize/stream/${encodeURIComponent(S.sid)}/end`, {});
+                }
+            } catch { }
+            try { S.evtAbort && S.evtAbort.abort(); } catch { } S.evtAbort = null;
+            S.sid = null; S.bufF32 = new Float32Array(0);
+            toast('Stream stopped');
+        }
+        async function flushLoop() {
+            const need = () => Math.round(S.targetRate * (S.chunkMs / 1000));
+            while (S.running) {
+                if (S.bufF32.length >= need() && S.outstanding < S.maxOutstanding && S.sid) {
+                    const f32 = drainF32(need());
+                    const bytes = int16FromF32(f32);
+                    const url = S.base.replace(/\/+$/, '') + `/recognize/stream/${encodeURIComponent(S.sid)}/audio?format=pcm16&sr=${S.targetRate}`;
+                    S.outstanding++; qs('outInfo').textContent = String(S.outstanding);
+                    try {
+                        await postBytes(url, bytes, {}, 20000);
+                    } catch (e) {
+                        const log = qs('streamLog'); log.style.display = 'block'; log.textContent = 'Audio send error: ' + e.message;
+                    } finally {
+                        S.outstanding--; qs('outInfo').textContent = String(S.outstanding);
+                    }
+                }
+                await new Promise(r => setTimeout(r, Math.max(10, S.chunkMs / 2)));
+            }
+        }
+
+        /* ======================== EVENTS ======================== */
+        async function openEvents(sid, useNkn) {
+            const live = qs('livePartial'); const finals = qs('finalList'); const log = qs('streamLog'); log.style.display = 'block'; log.textContent = '(listening for events)…';
+            live.textContent = ''; finals.innerHTML = '';
+
+            const onJson = (obj) => {
+                const t = (obj.type || obj.event || '').toLowerCase();
+
+                if (t === 'asr.partial' || t === 'partial') {
+                    if (obj.text) qs('livePartial').textContent = obj.text;
+                } else if (t === 'asr.final' || t === 'final') {
+                    if (obj.result && obj.result.text) {
+                        const d = document.createElement('div');
+                        d.className = 'bubble';
+                        d.textContent = obj.result.text; // server sends final under result.text
+                        qs('finalList').appendChild(d);
+                    } else if (obj.text) {
+                        const d = document.createElement('div');
+                        d.className = 'bubble';
+                        d.textContent = obj.text;
+                        qs('finalList').appendChild(d);
+                    }
+                    qs('livePartial').textContent = '';
+                } else if (t === 'error') {
+                    const log = qs('streamLog'); log.style.display = 'block';
+                    log.textContent = (log.textContent + '\n[error] ' + (obj.message || obj.error || '')).trim();
+                }
+
+            };
+
+            if (!useNkn) {
+                const ctrl = new AbortController(); S.evtAbort = ctrl;
+                try {
+                    const res = await fetch(S.base.replace(/\/+$/, '') + `/recognize/stream/${encodeURIComponent(sid)}/events`, { headers: authHeaders({}), signal: ctrl.signal });
+                    if (!res.ok || !res.body) throw new Error(`${res.status} ${res.statusText}`);
+                    const reader = res.body.getReader();
+                    const pump = createSSEDecoder((ev, data) => { try { onJson(JSON.parse(data)); } catch { } });
+                    while (true) { const { value, done } = await reader.read(); if (done) break; if (value && value.byteLength) pump(value); }
+                    log.textContent = '(events stream ended)';
+                } catch (e) {
+                    log.textContent = '(events error) ' + e.message;
+                } finally { S.evtAbort = null; }
+            } else {
+                const url = S.base.replace(/\/+$/, '') + `/recognize/stream/${encodeURIComponent(sid)}/events`;
+                const pump = createSSEDecoder((ev, data) => { try { onJson(JSON.parse(data)); } catch { } });
+                try {
+                    await nknSendRelayStream({
+                        url, method: 'GET',
+                        headers: authHeaders({ 'X-Relay-Stream': 'chunks' }),
+                        timeout_ms: 10 * 60 * 1000
+                    }, {
+                        onBegin: () => { },
+                        onChunk: (bytes) => pump(bytes),
+                        onEnd: () => { log.textContent = '(events stream ended)'; }
+                    });
+                } catch (e) {
+                    log.textContent = '(events error) ' + e.message;
+                }
+            }
+        }
+
+        /* ======================== WIRING ======================== */
+        function saveSettings() {
+            S.transport = qs('transport').value;
+            S.base = qs('baseUrl').value.trim() || S.base;
+            S.relayAddr = qs('relayAddr').value.trim();
+            S.apiKey = qs('apiKey').value.trim();
+            localStorage.setItem('asr.transport', S.transport);
+            localStorage.setItem('asr.base', S.base);
+            localStorage.setItem('asr.relayAddr', S.relayAddr);
+            localStorage.setItem('asr.apiKey', S.apiKey);
+            toast('Saved settings'); reflectTransportUI();
+            if (S.transport === 'nkn') nknEnsureClient(true); else nknDisconnect();
+            ensureModelsLoop(true);
+        }
+        function setInputsFromState() {
+            qs('transport').value = S.transport;
+            qs('baseUrl').value = S.base;
+            qs('relayAddr').value = S.relayAddr;
+            qs('apiKey').value = S.apiKey;
+            updateSessInfo();
+        }
+        async function firstLoad() {
+            if (S.transport === 'nkn') { try { await nknWaitReady(); } catch { } }
+            doHealth().catch(() => { });
+            ensureModelsLoop(true);
+            qs('status').innerHTML = `<span class="dot ok"></span><span>Ready</span>`;
+        }
+        function bindExamples() {
+            document.querySelectorAll('[data-example]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const k = btn.getAttribute('data-example');
+                    switch (k) {
+                        case 'file-short': qs('fileSr').value = '16000'; qs('fileFormat').value = 'auto'; doFile(); break;
+                        case 'stream-start': startStream(); break;
+                        case 'stream-stop': stopStream(); break;
+                    }
+                });
+            });
+        }
+
+        function init() {
+            setInputsFromState(); reflectTransportUI();
+            // buttons
+            qs('saveSettings').addEventListener('click', saveSettings);
+            qs('handshakeBtn').addEventListener('click', doHandshake);
+            qs('clearSession').addEventListener('click', clearSession);
+            qs('checkHealth').addEventListener('click', doHealth);
+            qs('loadModels').addEventListener('click', () => ensureModelsLoop(true));
+            qs('fileGo').addEventListener('click', doFile);
+            qs('streamStart').addEventListener('click', startStream);
+            qs('streamStop').addEventListener('click', stopStream);
+
+            qs('transport').addEventListener('change', e => {
+                S.transport = e.target.value; localStorage.setItem('asr.transport', S.transport); reflectTransportUI();
+                if (S.transport === 'nkn') nknEnsureClient(true); else nknDisconnect();
+                ensureModelsLoop(true);
+            });
+            qs('nknConnectBtn').addEventListener('click', () => { S.transport = 'nkn'; localStorage.setItem('asr.transport', 'nkn'); nknEnsureClient(true); reflectTransportUI(); });
+            qs('nknDisconnectBtn').addEventListener('click', () => { nknDisconnect(); });
+
+            // network awareness
+            window.addEventListener('online', () => { toast('Back online'); if (S.transport === 'nkn') nknScheduleReconnect(true); doHealth().then(() => ensureModelsLoop(true)).catch(() => { }); });
+            window.addEventListener('offline', () => { toast('Offline', false); });
+
+            bindExamples();
+            if (S.transport === 'nkn') nknEnsureClient();
+            firstLoad();
+        }
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+
+</html>
