@@ -408,6 +408,11 @@
                 <label>sample rate</label>
                 <input id="fileSr" type="number" placeholder="auto/16000" />
 
+                <!-- NEW: prompt -->
+                <label>prompt (optional)</label>
+                <textarea id="filePrompt"
+                    placeholder="Bias transcription (proper nouns, spellings, context)…"></textarea>
+
                 <div></div>
                 <div class="row">
                     <button id="fileGo">Transcribe</button>
@@ -442,6 +447,10 @@
                     <option value="160">160 ms</option>
                     <option value="200">200 ms</option>
                 </select>
+
+                <!-- NEW: prompt -->
+                <label>prompt (optional)</label>
+                <textarea id="streamPrompt" placeholder="Bias live decoding (keywords, names, spellings)…"></textarea>
 
                 <div></div>
                 <div class="row">
@@ -842,6 +851,7 @@
             const fmtSel = qs('fileFormat');
             const sr = parseInt(qs('fileSr').value || '0', 10) || 0;
             const model = (qs('modelName').value || '').trim();
+            const prompt = (qs('filePrompt').value || '').trim(); // NEW
 
             if (!fin || !fin.files || !fin.files.length) {
                 toast('Choose a file', false);
@@ -865,8 +875,8 @@
                     // ---- HTTP: send multipart/form-data with file=<blob>
                     const fd = new FormData();
                     fd.append('file', file, file.name);
-                    // (format/sample_rate are not needed for multipart; server decodes)
-                    // If you want to hint, you *could* add query params, but not required.
+                    if (prompt) fd.append('prompt', prompt); // NEW: pass prompt to backend
+
                     const res = await fetch(S.base.replace(/\/+$/, '') + '/recognize', {
                         method: 'POST',
                         headers: authOnlyHeaders(), // IMPORTANT: do not set Content-Type manually
@@ -875,7 +885,7 @@
                     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
                     data = await res.json();
                 } else {
-                    // ---- NKN: send JSON {body_b64, format, sample_rate}
+                    // ---- NKN: send JSON {body_b64, format, sample_rate, prompt}
                     const buf = new Uint8Array(await file.arrayBuffer());
                     const body_b64 = btoa(Array.from(buf).map(x => String.fromCharCode(x)).join(''));
 
@@ -883,8 +893,12 @@
                     const format = fmtSel.value === 'auto' ? undefined : fmtSel.value || undefined;
                     const sample_rate = sr || undefined;
 
-                    const payload = { body_b64, ...(format ? { format } : {}), ...(sample_rate ? { sample_rate } : {}) };
-                    // model is ignored by /recognize; full model is configured server-side
+                    const payload = {
+                        body_b64,
+                        ...(format ? { format } : {}),
+                        ...(sample_rate ? { sample_rate } : {}),
+                        ...(prompt ? { prompt } : {}) // NEW
+                    };
                     data = await nknFetchJSON('/recognize', 'POST', payload, authHeaders({}), 10 * 60 * 1000);
                 }
 
@@ -939,10 +953,12 @@
             if (S.running) return;
             // start session on server
             const model = (qs('modelName').value || '').trim() || undefined;
+            const prompt = (qs('streamPrompt').value || '').trim() || undefined; // NEW
             S.targetRate = parseInt(qs('targetRate').value || '16000', 10) || 16000;
             S.chunkMs = parseInt(qs('chunkMs').value || '120', 10) || 120;
             try {
-                const resp = await postJSON('/recognize/stream/start', { model });
+                // NEW: include prompt in start request
+                const resp = await postJSON('/recognize/stream/start', { model, ...(prompt ? { prompt } : {}) });
                 S.sid = (resp && (resp.sid || resp.id || resp.session)) || null;
                 if (!S.sid) throw new Error('No sid from server');
             } catch (e) { toast('Start failed: ' + e.message, false); return; }
@@ -1137,5 +1153,6 @@
         document.addEventListener('DOMContentLoaded', init);
     </script>
 </body>
+
 
 </html>
