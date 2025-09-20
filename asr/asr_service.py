@@ -59,6 +59,12 @@ ASR_PREVIEW_WINDOW_S=6.0            # tail window for live updates
 ASR_PREVIEW_STEP_S=0.9              # cadence for live updates
 ASR_SESSION_TTL_S=900               # idle GC
 CORS_ORIGINS=*                      # comma-separated or *
+
+Added support for passing a text prompt into Whisper:
+- File recognition: POST /recognize with multipart field `prompt` or JSON key `prompt`
+- Streaming: POST /recognize/stream/start with JSON key `prompt` or query ?prompt=...
+
+The prompt is applied to both live preview partials and the final transcript.
 """
 
 import os, sys, json, time, base64, threading, queue, subprocess, shutil, traceback
@@ -125,7 +131,7 @@ except Exception:
 try:
     import torch
 except Exception:
-    class _Dummy: 
+    class _Dummy:
         @staticmethod
         def cuda_is_available(): return False
     torch = None
@@ -301,7 +307,7 @@ def _resample_mono(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
         return y
 
 # ──────────────────────────────────────────────────────────────
-# 6) Transcribe helpers (preview & full)
+# 6) Transcribe helpers (preview & full) — now accept `prompt`
 # ──────────────────────────────────────────────────────────────
 def _segments_to_json(result: dict) -> list[dict]:
     out = []
@@ -309,10 +315,13 @@ def _segments_to_json(result: dict) -> list[dict]:
         out.append({"t0": float(seg.get("start", 0.0)), "t1": float(seg.get("end", 0.0)), "text": (seg.get("text") or "").strip()})
     return out
 
-def _transcribe_preview(x_f32_16k: np.ndarray) -> dict:
+def _transcribe_preview(x_f32_16k: np.ndarray, prompt: str | None = None) -> dict:
     if x_f32_16k.size == 0:
         return {"text":"", "segments":[], "language": None, "duration":0.0}
-    r = MODEL_PREVIEW.transcribe(x_f32_16k, language="en", fp16=False)
+    kw = {"language":"en", "fp16":False}
+    if prompt:
+        kw["prompt"] = str(prompt)
+    r = MODEL_PREVIEW.transcribe(x_f32_16k, **kw)
     return {
         "text": (r.get("text") or "").strip(),
         "segments": _segments_to_json(r),
@@ -320,10 +329,13 @@ def _transcribe_preview(x_f32_16k: np.ndarray) -> dict:
         "duration": float(r.get("duration", 0.0)),
     }
 
-def _transcribe_full(x_f32_16k: np.ndarray) -> dict:
+def _transcribe_full(x_f32_16k: np.ndarray, prompt: str | None = None) -> dict:
     if x_f32_16k.size == 0:
         return {"text":"", "segments":[], "language": None, "duration":0.0}
-    r = MODEL_FULL.transcribe(x_f32_16k, language="en", fp16=False)
+    kw = {"language":"en", "fp16":False}
+    if prompt:
+        kw["prompt"] = str(prompt)
+    r = MODEL_FULL.transcribe(x_f32_16k, **kw)
     return {
         "text": (r.get("text") or "").strip(),
         "segments": _segments_to_json(r),
@@ -338,12 +350,43 @@ def _diff_new_suffix(prev: str, curr: str) -> str:
     while i < n and prev_t[i] == curr_t[i]: i += 1
     return " ".join(curr_t[i:]).strip()
 
+def _extract_prompt_from_request(default: str | None = None) -> str | None:
+    """
+    Accept 'prompt' (or 'initial_prompt') from:
+      - query string (?prompt=...)
+      - JSON body ({ "prompt": "...", "initial_prompt": "..." })
+      - multipart form-field 'prompt' or 'initial_prompt'
+    """
+    # query wins if present
+    q = (request.args.get("prompt")
+         or request.args.get("initial_prompt"))
+    if q:
+        return q
+
+    # multipart form
+    if request.content_type and "multipart/form-data" in request.content_type:
+        p = request.form.get("prompt") or request.form.get("initial_prompt")
+        if p:
+            return p
+
+    # JSON
+    try:
+        payload = request.get_json(silent=True) or {}
+        p = payload.get("prompt") or payload.get("initial_prompt")
+        if p:
+            return str(p)
+    except Exception:
+        pass
+
+    return default
+
 # ──────────────────────────────────────────────────────────────
-# 7) Streaming session state
+# 7) Streaming session state (stores `prompt`)
 # ──────────────────────────────────────────────────────────────
 class StreamSession:
-    def __init__(self, sid: str):
+    def __init__(self, sid: str, prompt: str | None = None):
         self.id = sid
+        self.prompt = (prompt or "").strip() or None
         self.lock = threading.Lock()
         self.buf = np.zeros(0, dtype=np.float32)    # 16k mono
         self.created = time.time()
@@ -388,7 +431,7 @@ class StreamSession:
                     self.events.put({"event":"keepalive", "ts": int(time.time()*1000)})
                     continue
 
-                p = _transcribe_preview(x)
+                p = _transcribe_preview(x, prompt=self.prompt)
                 preview_text = p.get("text","").strip()
                 if not preview_text:
                     self.events.put({"event":"keepalive", "ts": int(time.time()*1000)})
@@ -416,7 +459,7 @@ class StreamSession:
         self.done.set()
         with self.lock:
             x = self.buf.copy()
-        final = _transcribe_full(x)
+        final = _transcribe_full(x, prompt=self.prompt)
         result = {
             "ok": True,
             "text": final.get("text",""),
@@ -444,9 +487,9 @@ def _get_session_or_404(sid: str) -> StreamSession | None:
     with _SESS_LOCK:
         return _SESSIONS.get(sid)
 
-def _create_session() -> StreamSession:
+def _create_session(prompt: str | None = None) -> StreamSession:
     sid = _new_session_id()
-    sess = StreamSession(sid)
+    sess = StreamSession(sid, prompt=prompt)
     with _SESS_LOCK:
         _SESSIONS[sid] = sess
     return sess
@@ -474,21 +517,18 @@ threading.Thread(target=_gc_loop, daemon=True).start()
 # ──────────────────────────────────────────────────────────────
 # 8) Routes
 # ──────────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return _ok({
-        "status": "ok",
-        "whisper": "ready",
-        "device": _device_or_auto(ASR_DEVICE),
-        "models": {
-            "full": MODEL_FULL._get_name() if hasattr(MODEL_FULL, "_get_name") else os.environ.get("ASR_MODEL_FULL",""),
-            "preview": MODEL_PREVIEW._get_name() if hasattr(MODEL_PREVIEW, "_get_name") else os.environ.get("ASR_MODEL_PREVIEW",""),
-        }
-    })
+app.get("/health")(lambda: _ok({
+    "status": "ok",
+    "whisper": "ready",
+    "device": _device_or_auto(ASR_DEVICE),
+    "models": {
+        "full": MODEL_FULL._get_name() if hasattr(MODEL_FULL, "_get_name") else os.environ.get("ASR_MODEL_FULL",""),
+        "preview": MODEL_PREVIEW._get_name() if hasattr(MODEL_PREVIEW, "_get_name") else os.environ.get("ASR_MODEL_PREVIEW",""),
+    }
+}))
 
 @app.get("/models")
 def models():
-    # openai-whisper exposes a hard-coded set; we reflect the common list
     available = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
     current = {
         "full": os.environ.get("ASR_MODEL_FULL", MODEL_FULL.__class__.__name__),
@@ -501,11 +541,13 @@ def recognize_file():
     """
     POST multipart/form-data:
         file=<audio>
+        prompt=<optional bias text>
 
     OR application/json:
-        {"body_b64":"...", "format":"wav|mp3|flac|pcm16", "sample_rate":16000}
+        {"body_b64":"...", "format":"wav|mp3|flac|pcm16", "sample_rate":16000, "prompt":"..." }
     """
     try:
+        prompt = _extract_prompt_from_request()
         if request.content_type and "multipart/form-data" in request.content_type:
             if "file" not in request.files:
                 return _err("missing file")
@@ -525,7 +567,7 @@ def recognize_file():
                 return _err("invalid base64")
             x, _ = _decode_any_to_f32(raw, fmt, int(sr) if sr else None)
 
-        r = _transcribe_full(x)
+        r = _transcribe_full(x, prompt=prompt)
         out = {
             "text": r["text"],
             "segments": r["segments"],
@@ -533,6 +575,7 @@ def recognize_file():
             "duration": r["duration"],
             "model": MODEL_FULL._get_name() if hasattr(MODEL_FULL, "_get_name") else os.environ.get("ASR_MODEL_FULL",""),
             "device": _device_or_auto(ASR_DEVICE),
+            "used_prompt": prompt or None
         }
         return _ok(out)
     except Exception as e:
@@ -540,8 +583,10 @@ def recognize_file():
 
 @app.post("/recognize/stream/start")
 def stream_start():
-    sess = _create_session()
-    return _ok({"id": sess.id, "ts": int(time.time()*1000)})
+    # accept prompt from JSON or query
+    prompt = _extract_prompt_from_request()
+    sess = _create_session(prompt=prompt)
+    return _ok({"id": sess.id, "ts": int(time.time()*1000), "used_prompt": prompt or None})
 
 @app.post("/recognize/stream/<sid>/audio")
 def stream_audio(sid: str):
@@ -605,7 +650,6 @@ def stream_events(sid: str):
 # 9) Main
 # ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Small banner
     dev = _device_or_auto(ASR_DEVICE)
     print(f"[ASR] device={dev}  models(full,preview)=({os.environ.get('ASR_MODEL_FULL', 'medium')},{os.environ.get('ASR_MODEL_PREVIEW','base')})")
     print(f"[ASR] http://{ASR_HOST}:{ASR_PORT}")
