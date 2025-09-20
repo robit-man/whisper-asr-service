@@ -11,7 +11,7 @@ End-to-end Automatic Speech Recognition (ASR) stack:
 
 ---
 
-## 📁 Folder Layout
+## Folder Layout
 
 ```
 
@@ -28,7 +28,7 @@ server.py             # static server for the frontend
 
 ---
 
-## ⚙️ Prerequisites
+## Prerequisites
 
 - **Python 3.10+** (the ASR service self-creates a `.venv/` and installs deps)
 - **FFmpeg** recommended (for non-PCM inputs); `libsndfile` via `soundfile` is attempted first
@@ -36,7 +36,7 @@ server.py             # static server for the frontend
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1) Start the ASR Service (port **8126** by default)
 
@@ -72,7 +72,7 @@ python3 server.py
 
 ---
 
-## 🔧 Configuration
+## Configuration
 
 ### ASR Service (`asr/.env`)
 
@@ -114,7 +114,7 @@ LOG_LEVEL=info
 
 ---
 
-## 🛠️ ASR Service API
+## ASR Service API
 
 Base URL: `http://<ASR_HOST>:<ASR_PORT>` (default `http://127.0.0.1:8126`)
 
@@ -446,7 +446,7 @@ python3 server.py
 
 ---
 
-## 🧩 Integration Examples
+## Integration Examples
 
 ### A. Transcribe a file (HTTP)
 
@@ -506,7 +506,7 @@ curl -s -X POST "http://127.0.0.1:8126/recognize/stream/$SID/end"
 
 ---
 
-## 🧭 Troubleshooting
+## Troubleshooting
 
 * **400 `missing body_b64` on `/recognize`**
   You sent JSON without `body_b64`. Use **multipart** `file=` (HTTP) or include `body_b64` when using JSON (e.g., via NKN).
@@ -528,7 +528,7 @@ curl -s -X POST "http://127.0.0.1:8126/recognize/stream/$SID/end"
 
 ---
 
-## 📐 Data Contracts
+## Data Contracts
 
 ### Transcription Object
 
@@ -554,7 +554,7 @@ curl -s -X POST "http://127.0.0.1:8126/recognize/stream/$SID/end"
 
 ---
 
-## 🔒 Security Notes
+## Security Notes
 
 * The ASR service includes CORS and accepts pass-through auth headers, but doesn’t validate them by default.
 * For production, put it behind an API gateway / reverse proxy that:
@@ -565,7 +565,7 @@ curl -s -X POST "http://127.0.0.1:8126/recognize/stream/$SID/end"
 
 ---
 
-## 🧱 Implementation Notes
+## Implementation Notes
 
 * **Whisper model pool:** Process-global, ref-counted; device normalized (`auto`→`cuda` if available else `cpu`).
 * **Decoding path:** `soundfile` → FFmpeg fallback → PCM16 fast path.
@@ -574,7 +574,7 @@ curl -s -X POST "http://127.0.0.1:8126/recognize/stream/$SID/end"
 
 ---
 
-## ✅ Compatibility
+## Compatibility
 
 * Tested with browser capture at **16 kHz PCM16LE mono**.
 * Works with compressed uploads (WAV/FLAC/MP3/OGG) if `soundfile` or FFmpeg available.
@@ -582,7 +582,7 @@ curl -s -X POST "http://127.0.0.1:8126/recognize/stream/$SID/end"
 
 ---
 
-## 🗓️ Changelog (highlights)
+##  Changelog (highlights)
 
 * Initial release:
 
