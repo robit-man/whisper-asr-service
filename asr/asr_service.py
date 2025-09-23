@@ -4,25 +4,26 @@
 asr_service.py — Whisper ASR microservice (file & live streaming)
 
 This version includes:
+- Fast vs Accurate modes (runtime-selectable) for preview cadence & model
 - Prompt support for preview & final decoding
 - Server-side auto-finalize after idle
-- Preview debounced to "new audio only" to prevent drift/hallucinations
+- Preview debounced to "new audio only" to reduce drift/hallucinations
 - Decoding guardrails (temperature, no_speech/logprob/compression thresholds)
 - Device-aware fp16/fp32 selection & PyTorch perf hints
-- Meta returned with final (avg_logprob, no_speech_prob, compression_ratio)
-- Same public API as before
+- Optional final beam search + word timestamps
+- Rich /health and /models, CORS, simple venv bootstrap
 
 Routes:
   GET  /health
   GET  /models
-  POST /recognize                            (file or JSON base64)
-  POST /recognize/stream/start               (start session; accepts prompt)
-  POST /recognize/stream/<sid>/audio         (PCM16 or any via format hint)
-  POST /recognize/stream/<sid>/end           (finalize)
-  GET  /recognize/stream/<sid>/events        (SSE: partials, keepalive, final)
+  POST /recognize                                   (file or JSON base64)
+  POST /recognize/stream/start                      (start session; accepts prompt, mode)
+  POST /recognize/stream/<sid>/audio                (PCM16 or any via format hint)
+  POST /recognize/stream/<sid>/end                  (finalize)
+  GET  /recognize/stream/<sid>/events               (SSE: partials, keepalive, final)
 """
 
-import os, sys, json, time, base64, threading, queue, subprocess, shutil, traceback
+import os, sys, json, time, base64, threading, queue, subprocess, shutil
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────
@@ -66,7 +67,6 @@ def _ensure_deps():
 if not _in_venv():
     _ensure_venv()
     os.execv(str(PY), [str(PY), *sys.argv])
-
 _ensure_deps()
 
 # ──────────────────────────────────────────────────────────────
@@ -99,49 +99,74 @@ if not ENV.exists():
         "ASR_HOST=0.0.0.0\n"
         "ASR_PORT=8126\n"
         "ASR_DEVICE=auto\n"
-        "ASR_MODEL_FULL=medium\n"
-        "ASR_MODEL_PREVIEW=base\n"
-        "ASR_PREVIEW_WINDOW_S=6.0\n"
-        "ASR_PREVIEW_STEP_S=0.9\n"
-        "ASR_SESSION_TTL_S=900\n"
         "CORS_ORIGINS=*\n"
         "\n"
-        "# NEW toggles\n"
-        "ASR_FP16=auto\n"
+        "# ===== Model names =====\n"
+        "ASR_MODEL_FULL=medium\n"
+        "ASR_FAST_MODEL_PREVIEW=tiny\n"
+        "ASR_ACCURATE_MODEL_PREVIEW=base\n"
+        "\n"
+        "# ===== Mode defaults =====\n"
+        "ASR_MODE_DEFAULT=fast\n"
+        "ASR_FAST_PREVIEW_WINDOW_S=3.0\n"
+        "ASR_FAST_PREVIEW_STEP_S=0.25\n"
+        "ASR_ACCURATE_PREVIEW_WINDOW_S=6.0\n"
+        "ASR_ACCURATE_PREVIEW_STEP_S=0.9\n"
+        "\n"
+        "# ===== Final decode =====\n"
+        "ASR_FINAL_BEAM_SIZE=5\n"
+        "ASR_FINAL_WORD_TIMESTAMPS=true\n"
+        "\n"
+        "# ===== Safety/quality knobs =====\n"
         "ASR_TEMPERATURE=0.0\n"
         "ASR_CONDITION_PREV=false\n"
         "ASR_NO_SPEECH_THRESHOLD=0.6\n"
         "ASR_LOGPROB_THRESHOLD=-1.0\n"
         "ASR_COMPRESSION_RATIO_THRESHOLD=2.4\n"
-        "ASR_PREVIEW_DET=true\n"
-        "ASR_PREVIEW_MIN_DELTA_S=0.15\n"
+        "\n"
+        "# ===== Runtime =====\n"
+        "ASR_SESSION_TTL_S=900\n"
         "ASR_AUTO_FINALIZE_S=1.4\n"
+        "ASR_FP16=auto\n"
         "ASR_TORCH_THREADS=0\n"
     )
     print("→ wrote .env with defaults")
 
 _cfg = {**dotenv_values(str(ENV))}
+
 ASR_HOST = _cfg.get("ASR_HOST") or "0.0.0.0"
 ASR_PORT = int(_cfg.get("ASR_PORT") or "8126")
 ASR_DEVICE = (_cfg.get("ASR_DEVICE") or "auto").strip().lower()
-MODEL_FULL_NAME = (_cfg.get("ASR_MODEL_FULL") or "medium").strip()
-MODEL_PREV_NAME = (_cfg.get("ASR_MODEL_PREVIEW") or "base").strip()
-PREVIEW_WIN_S  = float(_cfg.get("ASR_PREVIEW_WINDOW_S") or "6.0")
-PREVIEW_STEP_S = float(_cfg.get("ASR_PREVIEW_STEP_S") or "0.9")
-SESSION_TTL_S  = int(_cfg.get("ASR_SESSION_TTL_S") or "900")
-CORS_ORIGINS   = (_cfg.get("CORS_ORIGINS") or "*").strip()
+CORS_ORIGINS = (_cfg.get("CORS_ORIGINS") or "*").strip()
 
-# New knobs
-AUTO_FINALIZE_S = float(_cfg.get("ASR_AUTO_FINALIZE_S") or "1.4")
-FP16_MODE = (_cfg.get("ASR_FP16") or "auto").strip().lower()    # auto|true|false
-TEMP = float(_cfg.get("ASR_TEMPERATURE") or "0.0")
-COND_PREV = (_cfg.get("ASR_CONDITION_PREV") or "false").strip().lower() == "true"
-NS_THRESH = float(_cfg.get("ASR_NO_SPEECH_THRESHOLD") or "0.6")
-LP_THRESH = float(_cfg.get("ASR_LOGPROB_THRESHOLD") or "-1.0")
-CR_THRESH = float(_cfg.get("ASR_COMPRESSION_RATIO_THRESHOLD") or "2.4")
-PREVIEW_DET = (_cfg.get("ASR_PREVIEW_DET") or "true").strip().lower() == "true"
-PREVIEW_MIN_DELTA_S = float(_cfg.get("ASR_PREVIEW_MIN_DELTA_S") or "0.15")
-TORCH_THREADS = int(_cfg.get("ASR_TORCH_THREADS") or "0")
+# Models
+MODEL_FULL_NAME   = (_cfg.get("ASR_MODEL_FULL") or "medium").strip()
+FAST_MODEL_PREV   = (_cfg.get("ASR_FAST_MODEL_PREVIEW") or "tiny").strip()
+ACC_MODEL_PREV    = (_cfg.get("ASR_ACCURATE_MODEL_PREVIEW") or "base").strip()
+
+# Mode defaults
+MODE_DEFAULT      = (_cfg.get("ASR_MODE_DEFAULT") or "fast").strip().lower()
+FAST_WIN_S        = float(_cfg.get("ASR_FAST_PREVIEW_WINDOW_S") or "3.0")
+FAST_STEP_S       = float(_cfg.get("ASR_FAST_PREVIEW_STEP_S") or "0.25")
+ACC_WIN_S         = float(_cfg.get("ASR_ACCURATE_PREVIEW_WINDOW_S") or "6.0")
+ACC_STEP_S        = float(_cfg.get("ASR_ACCURATE_PREVIEW_STEP_S") or "0.9")
+
+# Final decode
+FINAL_BEAM_SIZE   = int(_cfg.get("ASR_FINAL_BEAM_SIZE") or "5")
+FINAL_WORDS       = str(_cfg.get("ASR_FINAL_WORD_TIMESTAMPS") or "true").strip().lower() == "true"
+
+# Safety/quality knobs
+TEMP              = float(_cfg.get("ASR_TEMPERATURE") or "0.0")
+COND_PREV         = (_cfg.get("ASR_CONDITION_PREV") or "false").strip().lower() == "true"
+NS_THRESH         = float(_cfg.get("ASR_NO_SPEECH_THRESHOLD") or "0.6")
+LP_THRESH         = float(_cfg.get("ASR_LOGPROB_THRESHOLD") or "-1.0")
+CR_THRESH         = float(_cfg.get("ASR_COMPRESSION_RATIO_THRESHOLD") or "2.4")
+
+# Runtime
+SESSION_TTL_S     = int(_cfg.get("ASR_SESSION_TTL_S") or "900")
+AUTO_FINALIZE_S   = float(_cfg.get("ASR_AUTO_FINALIZE_S") or "1.4")
+FP16_MODE         = (_cfg.get("ASR_FP16") or "auto").strip().lower()    # auto|true|false
+TORCH_THREADS     = int(_cfg.get("ASR_TORCH_THREADS") or "0")
 
 # ──────────────────────────────────────────────────────────────
 # 3) Torch/device helpers + model pool
@@ -212,9 +237,16 @@ def _release_whisper_model(name: str, device: str | None = None):
     except Exception:
         pass
 
-# Preload (fast first hit)
-MODEL_PREVIEW = _get_whisper_model(MODEL_PREV_NAME, ASR_DEVICE)
-MODEL_FULL    = _get_whisper_model(MODEL_FULL_NAME, ASR_DEVICE)
+# Preload models
+MODEL_FULL          = _get_whisper_model(MODEL_FULL_NAME, ASR_DEVICE)
+MODEL_FAST_PREVIEW  = _get_whisper_model(FAST_MODEL_PREV, ASR_DEVICE)
+MODEL_ACC_PREVIEW   = _get_whisper_model(ACC_MODEL_PREV, ASR_DEVICE)
+
+def _model_name(m, fallback: str) -> str:
+    try:
+        return getattr(m, "_get_name", lambda: fallback)()
+    except Exception:
+        return fallback
 
 # ──────────────────────────────────────────────────────────────
 # 4) Flask app
@@ -302,21 +334,40 @@ def _fp16_for_device(dev: str) -> bool:
     if FP16_MODE == "false": return False
     return dev == "cuda"
 
-def _decoding_kw(is_preview: bool, prompt: str | None) -> dict:
-    dev = _device_or_auto(ASR_DEVICE)
-    kw = {
-        "language": "en",
-        "fp16": _fp16_for_device(dev),
-        "temperature": TEMP if (not is_preview or PREVIEW_DET) else 0.2,
-        "condition_on_previous_text": COND_PREV if not is_preview else False,
-        "no_speech_threshold": NS_THRESH,
-        "logprob_threshold": LP_THRESH,
-        "compression_ratio_threshold": CR_THRESH,
-        "suppress_tokens": [-1],  # keep Whisper defaults, also suppress common junk
-    }
-    if prompt:
-        kw["prompt"] = str(prompt)
-    return kw
+_COMMON_FILTERS = dict(
+    compression_ratio_threshold=CR_THRESH,
+    logprob_threshold=LP_THRESH,
+    no_speech_threshold=NS_THRESH,
+)
+
+FAST_PREVIEW_OPTS = dict(
+    language="en",
+    fp16=_fp16_for_device(_device_or_auto(ASR_DEVICE)),
+    condition_on_previous_text=False,
+    temperature=0.0,
+    word_timestamps=False,
+    **_COMMON_FILTERS,
+)
+
+ACCURATE_PREVIEW_OPTS = dict(
+    language="en",
+    fp16=_fp16_for_device(_device_or_auto(ASR_DEVICE)),
+    condition_on_previous_text=False,
+    temperature=0.0,
+    word_timestamps=False,
+    **_COMMON_FILTERS,
+)
+
+FINAL_OPTS = dict(
+    language="en",
+    fp16=_fp16_for_device(_device_or_auto(ASR_DEVICE)),
+    temperature=TEMP,
+    **_COMMON_FILTERS,
+)
+if FINAL_BEAM_SIZE and FINAL_BEAM_SIZE > 1:
+    FINAL_OPTS["beam_size"] = FINAL_BEAM_SIZE
+if FINAL_WORDS:
+    FINAL_OPTS["word_timestamps"] = True
 
 def _segments_to_json(result: dict) -> list[dict]:
     out = []
@@ -328,11 +379,13 @@ def _segments_to_json(result: dict) -> list[dict]:
         })
     return out
 
-def _transcribe_preview(x_f32_16k: np.ndarray, prompt: str | None = None) -> dict:
+def _transcribe_preview_with(model, x_f32_16k: np.ndarray, prompt: str | None, opts: dict) -> dict:
     if x_f32_16k.size == 0:
         return {"text":"", "segments":[], "language": None, "duration":0.0}
-    kw = _decoding_kw(is_preview=True, prompt=prompt)
-    r = MODEL_PREVIEW.transcribe(x_f32_16k, **kw)
+    kw = dict(opts)
+    if prompt:
+        kw["prompt"] = str(prompt)
+    r = model.transcribe(x_f32_16k, **kw)
     return {
         "text": (r.get("text") or "").strip(),
         "segments": _segments_to_json(r),
@@ -346,9 +399,11 @@ def _transcribe_preview(x_f32_16k: np.ndarray, prompt: str | None = None) -> dic
 def _transcribe_full(x_f32_16k: np.ndarray, prompt: str | None = None) -> dict:
     if x_f32_16k.size == 0:
         return {"text":"", "segments":[], "language": None, "duration":0.0}
-    kw = _decoding_kw(is_preview=False, prompt=prompt)
+    kw = dict(FINAL_OPTS)
+    if prompt:
+        kw["prompt"] = str(prompt)
     r = MODEL_FULL.transcribe(x_f32_16k, **kw)
-    return {
+    out = {
         "text": (r.get("text") or "").strip(),
         "segments": _segments_to_json(r),
         "language": r.get("language"),
@@ -357,6 +412,17 @@ def _transcribe_full(x_f32_16k: np.ndarray, prompt: str | None = None) -> dict:
         "no_speech_prob": float(r.get("no_speech_prob", float("nan"))) if "no_speech_prob" in r else None,
         "compression_ratio": float(r.get("compression_ratio", float("nan"))) if "compression_ratio" in r else None,
     }
+    if FINAL_OPTS.get("word_timestamps"):
+        words = []
+        for seg in (r.get("segments") or []):
+            for w in (seg.get("words") or []):
+                words.append({
+                    "t0": float(w.get("start", 0.0)),
+                    "t1": float(w.get("end", 0.0)),
+                    "text": (w.get("word") or "").strip()
+                })
+        out["words"] = words
+    return out
 
 def _diff_new_suffix(prev: str, curr: str) -> str:
     if not curr:
@@ -369,28 +435,38 @@ def _diff_new_suffix(prev: str, curr: str) -> str:
 
 def _extract_prompt_from_request(default: str | None = None) -> str | None:
     q = (request.args.get("prompt") or request.args.get("initial_prompt"))
-    if q:
-        return q
+    if q: return q
     if request.content_type and "multipart/form-data" in request.content_type:
         p = request.form.get("prompt") or request.form.get("initial_prompt")
-        if p:
-            return p
+        if p: return p
     try:
         payload = request.get_json(silent=True) or {}
         p = payload.get("prompt") or payload.get("initial_prompt")
-        if p:
-            return str(p)
+        if p: return str(p)
     except Exception:
         pass
     return default
 
 # ──────────────────────────────────────────────────────────────
-# 7) Streaming session (with idle auto-finalize & debounced preview)
+# 7) Streaming session (mode-aware, idle auto-finalize & debounced preview)
 # ──────────────────────────────────────────────────────────────
 class StreamSession:
-    def __init__(self, sid: str, prompt: str | None = None):
+    def __init__(self,
+                 sid: str,
+                 prompt: str | None = None,
+                 mode: str = "fast",
+                 preview_model=None,
+                 preview_opts: dict | None = None,
+                 win_s: float | None = None,
+                 step_s: float | None = None):
         self.id = sid
         self.prompt = (prompt or "").strip() or None
+        self.mode = (mode or "fast").lower()
+        self.preview_model = preview_model or (MODEL_FAST_PREVIEW if self.mode == "fast" else MODEL_ACC_PREVIEW)
+        self.preview_opts = dict(preview_opts or (FAST_PREVIEW_OPTS if self.mode == "fast" else ACCURATE_PREVIEW_OPTS))
+        self.win_s = float(win_s if win_s is not None else (FAST_WIN_S if self.mode == "fast" else ACC_WIN_S))
+        self.step_s = float(step_s if step_s is not None else (FAST_STEP_S if self.mode == "fast" else ACC_STEP_S))
+
         self.lock = threading.Lock()
         self.buf = np.zeros(0, dtype=np.float32)    # 16k mono
         self.created = time.time()
@@ -430,13 +506,13 @@ class StreamSession:
         return len(x) / 16000.0
 
     def _preview_loop(self):
-        # emits asr.partial on a cadence while not done
+        # emits asr.partial/keepalive while not done
         while not self.done.is_set():
-            time.sleep(PREVIEW_STEP_S)
+            time.sleep(max(0.05, float(self.step_s)))
             try:
                 now = time.time()
                 with self.lock:
-                    tail_len = int(PREVIEW_WIN_S * 16000)
+                    tail_len = int(self.win_s * 16000)
                     x = self.buf[-tail_len:].copy()
                     buf_len = len(self.buf)
                     last_change_age = now - self._last_len_change_ts
@@ -451,8 +527,8 @@ class StreamSession:
                     self.events.put({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
-                # 2) Debounce preview unless we have NEW audio since last tick
-                if last_change_age < PREVIEW_MIN_DELTA_S:
+                # 2) Debounce preview unless NEW audio since last tick
+                if last_change_age < self.step_s * 0.6:  # a bit less than cadence
                     self.events.put({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
@@ -460,8 +536,8 @@ class StreamSession:
                     self.events.put({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
-                p = _transcribe_preview(x, prompt=self.prompt)
-                preview_text = p.get("text","").strip()
+                r = _transcribe_preview_with(self.preview_model, x, self.prompt, self.preview_opts)
+                preview_text = r.get("text","").strip()
                 if not preview_text:
                     self.events.put({"event":"keepalive", "ts": int(now*1000)})
                     continue
@@ -474,6 +550,7 @@ class StreamSession:
                         "id": self.id,
                         "text": self._running_text,
                         "words_added": new_suffix,
+                        "mode": self.mode,
                         "ts": int(now*1000),
                     })
                 else:
@@ -485,7 +562,7 @@ class StreamSession:
 
     def finalize(self) -> dict:
         if self.done.is_set():
-            # Already finalized; replicate result by reading current buf
+            # already finalized; still produce a result from current buf snapshot
             pass
         self.done.set()
         with self.lock:
@@ -500,9 +577,12 @@ class StreamSession:
             "avg_logprob": final.get("avg_logprob"),
             "no_speech_prob": final.get("no_speech_prob"),
             "compression_ratio": final.get("compression_ratio"),
-            "model": getattr(MODEL_FULL, "_get_name", lambda: MODEL_FULL_NAME)(),
+            "model": _model_name(MODEL_FULL, MODEL_FULL_NAME),
             "device": _device_or_auto(ASR_DEVICE),
+            "mode": self.mode,
         }
+        if "words" in final:
+            result["words"] = final["words"]
         try:
             self.events.put({"event":"asr.final", "id": self.id, "result": result, "ts": int(time.time()*1000)})
         except Exception:
@@ -520,9 +600,15 @@ def _get_session_or_404(sid: str) -> StreamSession | None:
     with _SESS_LOCK:
         return _SESSIONS.get(sid)
 
-def _create_session(prompt: str | None = None) -> StreamSession:
+def _create_session(*, prompt: str | None, mode: str, preview_model, preview_opts: dict, win_s: float, step_s: float) -> StreamSession:
     sid = _new_session_id()
-    sess = StreamSession(sid, prompt=prompt)
+    sess = StreamSession(sid,
+                         prompt=prompt,
+                         mode=mode,
+                         preview_model=preview_model,
+                         preview_opts=preview_opts,
+                         win_s=win_s,
+                         step_s=step_s)
     with _SESS_LOCK:
         _SESSIONS[sid] = sess
     return sess
@@ -543,7 +629,6 @@ def _gc_loop():
     while True:
         time.sleep(15)
         _gc_sessions()
-
 threading.Thread(target=_gc_loop, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────
@@ -551,35 +636,30 @@ threading.Thread(target=_gc_loop, daemon=True).start()
 # ──────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    try:
-        full_name = getattr(MODEL_FULL, "_get_name", lambda: MODEL_FULL_NAME)()
-    except Exception:
-        full_name = MODEL_FULL_NAME
-    try:
-        prev_name = getattr(MODEL_PREVIEW, "_get_name", lambda: MODEL_PREV_NAME)()
-    except Exception:
-        prev_name = MODEL_PREV_NAME
-
     return _ok({
         "status": "ok",
         "whisper": "ready",
         "device": _device_or_auto(ASR_DEVICE),
-        "models": {"full": full_name, "preview": prev_name}
+        "models": {
+            "full": _model_name(MODEL_FULL, MODEL_FULL_NAME),
+            "preview_fast": _model_name(MODEL_FAST_PREVIEW, FAST_MODEL_PREV),
+            "preview_accurate": _model_name(MODEL_ACC_PREVIEW, ACC_MODEL_PREV),
+        },
+        "modes": {
+            "default": MODE_DEFAULT,
+            "fast": {"window_s": FAST_WIN_S, "step_s": FAST_STEP_S, "model": FAST_MODEL_PREV},
+            "accurate": {"window_s": ACC_WIN_S, "step_s": ACC_STEP_S, "model": ACC_MODEL_PREV},
+        }
     })
 
 @app.get("/models")
 def models():
     available = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
-    try:
-        full_name = getattr(MODEL_FULL, "_get_name", lambda: MODEL_FULL_NAME)()
-    except Exception:
-        full_name = MODEL_FULL_NAME
-    try:
-        prev_name = getattr(MODEL_PREVIEW, "_get_name", lambda: MODEL_PREV_NAME)()
-    except Exception:
-        prev_name = MODEL_PREV_NAME
-
-    current = {"full": full_name, "preview": prev_name}
+    current = {
+        "full": _model_name(MODEL_FULL, MODEL_FULL_NAME),
+        "preview_fast": _model_name(MODEL_FAST_PREVIEW, FAST_MODEL_PREV),
+        "preview_accurate": _model_name(MODEL_ACC_PREVIEW, ACC_MODEL_PREV),
+    }
     return _ok({"models": [{"name": n} for n in available], "current": current})
 
 @app.post("/recognize")
@@ -619,12 +699,13 @@ def recognize_file():
             "segments": r["segments"],
             "language": r["language"],
             "duration": r["duration"],
-            "model": getattr(MODEL_FULL, "_get_name", lambda: MODEL_FULL_NAME)(),
+            "model": _model_name(MODEL_FULL, MODEL_FULL_NAME),
             "device": _device_or_auto(ASR_DEVICE),
             "used_prompt": prompt or None,
             "avg_logprob": r.get("avg_logprob"),
             "no_speech_prob": r.get("no_speech_prob"),
             "compression_ratio": r.get("compression_ratio"),
+            "words": r.get("words"),
         }
         return _ok(out)
     except Exception as e:
@@ -632,9 +713,43 @@ def recognize_file():
 
 @app.post("/recognize/stream/start")
 def stream_start():
+    payload = request.get_json(silent=True) or {}
     prompt = _extract_prompt_from_request()
-    sess = _create_session(prompt=prompt)
-    return _ok({"id": sess.id, "ts": int(time.time()*1000), "used_prompt": prompt or None})
+    mode = (request.args.get("mode") or payload.get("mode") or MODE_DEFAULT).strip().lower()
+    mode = mode if mode in ("fast", "accurate") else MODE_DEFAULT
+
+    # cadence overrides
+    win_s  = float(request.args.get("preview_window_s") or payload.get("preview_window_s") or (FAST_WIN_S if mode=="fast" else ACC_WIN_S))
+    step_s = float(request.args.get("preview_step_s")  or payload.get("preview_step_s")  or (FAST_STEP_S if mode=="fast" else ACC_STEP_S))
+
+    # preview model override by name (optional)
+    model_name = (request.args.get("preview_model") or payload.get("preview_model") or
+                  (FAST_MODEL_PREV if mode=="fast" else ACC_MODEL_PREV)).strip()
+    if model_name == FAST_MODEL_PREV:
+        preview_model = MODEL_FAST_PREVIEW
+    elif model_name == ACC_MODEL_PREV:
+        preview_model = MODEL_ACC_PREVIEW
+    else:
+        preview_model = _get_whisper_model(model_name, ASR_DEVICE)
+
+    preview_opts = FAST_PREVIEW_OPTS if mode == "fast" else ACCURATE_PREVIEW_OPTS
+
+    sess = _create_session(prompt=prompt,
+                           mode=mode,
+                           preview_model=preview_model,
+                           preview_opts=preview_opts,
+                           win_s=win_s,
+                           step_s=step_s)
+
+    return _ok({
+        "id": sess.id,
+        "ts": int(time.time()*1000),
+        "used_prompt": prompt or None,
+        "mode": mode,
+        "preview_model": model_name,
+        "preview_window_s": win_s,
+        "preview_step_s": step_s
+    })
 
 @app.post("/recognize/stream/<sid>/audio")
 def stream_audio(sid: str):
@@ -701,15 +816,11 @@ def stream_events(sid: str):
 # ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     dev = _device_or_auto(ASR_DEVICE)
-    try:
-        full_name = getattr(MODEL_FULL, "_get_name", lambda: MODEL_FULL_NAME)()
-    except Exception:
-        full_name = MODEL_FULL_NAME
-    try:
-        prev_name = getattr(MODEL_PREVIEW, "_get_name", lambda: MODEL_PREV_NAME)()
-    except Exception:
-        prev_name = MODEL_PREV_NAME
-
-    print(f"[ASR] device={dev}  models(full,preview)=({full_name},{prev_name})")
+    print(f"[ASR] device={dev}")
+    print(f"[ASR] models: full={_model_name(MODEL_FULL, MODEL_FULL_NAME)}  "
+          f"fast_prev={_model_name(MODEL_FAST_PREVIEW, FAST_MODEL_PREV)}  "
+          f"acc_prev={_model_name(MODEL_ACC_PREVIEW, ACC_MODEL_PREV)}")
+    print(f"[ASR] modes: default={MODE_DEFAULT}  fast(win={FAST_WIN_S}s,step={FAST_STEP_S}s)  "
+          f"accurate(win={ACC_WIN_S}s,step={ACC_STEP_S}s)")
     print(f"[ASR] http://{ASR_HOST}:{ASR_PORT}")
     app.run(host=ASR_HOST, port=ASR_PORT, threaded=True)
