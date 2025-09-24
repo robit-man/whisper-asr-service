@@ -3,27 +3,28 @@
 """
 asr_service.py — Whisper ASR microservice (file & live streaming)
 
-This version includes:
-- Fast vs Accurate modes (runtime-selectable) for preview cadence & model
-- Prompt support for preview & final decoding
-- Server-side auto-finalize after idle
-- Preview debounced to "new audio only" to reduce drift/hallucinations
-- Decoding guardrails (temperature, no_speech/logprob/compression thresholds)
-- Device-aware fp16/fp32 selection & PyTorch perf hints
-- Optional final beam search + word timestamps
-- Rich /health and /models, CORS, simple venv bootstrap
+Upgrades:
+- Production-ready WSGI serve by default (waitress). Exported `app` for gunicorn.
+- Admission control: bounded sessions + bounded model invocations with 429 back-pressure.
+- Session semaphore held for lifetime of stream; released on close/GC.
+- Optional per-IP token-bucket rate limits and simple body-size guard.
+- Bounded SSE queues with drop strategy to protect memory.
+- Fix: release custom preview models (no GPU ref-count leak).
+- /metrics endpoint for router-level shedding decisions.
 
 Routes:
   GET  /health
+  GET  /metrics
   GET  /models
-  POST /recognize                                   (file or JSON base64)
-  POST /recognize/stream/start                      (start session; accepts prompt, mode)
-  POST /recognize/stream/<sid>/audio                (PCM16 or any via format hint)
-  POST /recognize/stream/<sid>/end                  (finalize)
-  GET  /recognize/stream/<sid>/events               (SSE: partials, keepalive, final)
+  POST /recognize
+  POST /recognize/stream/start
+  POST /recognize/stream/<sid>/audio
+  POST /recognize/stream/<sid>/end
+  GET  /recognize/stream/<sid>/events
 """
 
 import os, sys, json, time, base64, threading, queue, subprocess, shutil
+import contextlib
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────
@@ -61,6 +62,8 @@ def _ensure_deps():
     except Exception: need += ["soundfile"]
     try: import whisper  # type: ignore
     except Exception: need += ["openai-whisper"]
+    try: import waitress  # type: ignore
+    except Exception: need += ["waitress"]
     if need:
         subprocess.check_call([str(PIP), "install", *need])
 
@@ -74,7 +77,7 @@ _ensure_deps()
 # ──────────────────────────────────────────────────────────────
 import math
 import numpy as np
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, g
 from flask_cors import CORS
 from dotenv import dotenv_values
 
@@ -129,6 +132,18 @@ if not ENV.exists():
         "ASR_AUTO_FINALIZE_S=1.4\n"
         "ASR_FP16=auto\n"
         "ASR_TORCH_THREADS=0\n"
+        "\n"
+        "# ===== Concurrency / capacity =====\n"
+        "ASR_MAX_SESSIONS=16\n"
+        "ASR_SESSION_ACQUIRE_TIMEOUT_S=3.0\n"
+        "ASR_MAX_TRANSCRIPTS=2\n"
+        "ASR_TRANSCRIBE_TIMEOUT_S=30.0\n"
+        "ASR_EVENTS_QUEUE_MAX=256\n"
+        "ASR_MAX_BODY_BYTES=10485760\n"
+        "\n"
+        "# ===== Rate limiting =====\n"
+        "ASR_RLIMIT_RPS=10\n"
+        "ASR_RLIMIT_BURST=20\n"
     )
     print("→ wrote .env with defaults")
 
@@ -168,6 +183,18 @@ AUTO_FINALIZE_S   = float(_cfg.get("ASR_AUTO_FINALIZE_S") or "1.4")
 FP16_MODE         = (_cfg.get("ASR_FP16") or "auto").strip().lower()    # auto|true|false
 TORCH_THREADS     = int(_cfg.get("ASR_TORCH_THREADS") or "0")
 
+# Concurrency / capacity controls
+ASR_MAX_SESSIONS                = max(1, int(_cfg.get("ASR_MAX_SESSIONS") or "16"))
+ASR_SESSION_ACQUIRE_TIMEOUT_S   = float(_cfg.get("ASR_SESSION_ACQUIRE_TIMEOUT_S") or "3.0")
+ASR_MAX_TRANSCRIPTS             = max(1, int(_cfg.get("ASR_MAX_TRANSCRIPTS") or "2"))
+ASR_TRANSCRIBE_TIMEOUT_S        = float(_cfg.get("ASR_TRANSCRIBE_TIMEOUT_S") or "30.0")
+ASR_EVENTS_QUEUE_MAX            = max(8, int(_cfg.get("ASR_EVENTS_QUEUE_MAX") or "256"))
+ASR_MAX_BODY_BYTES              = int(_cfg.get("ASR_MAX_BODY_BYTES") or "10485760")
+
+# Rate limits
+ASR_RLIMIT_RPS   = max(1, int(_cfg.get("ASR_RLIMIT_RPS") or "10"))
+ASR_RLIMIT_BURST = max(1, int(_cfg.get("ASR_RLIMIT_BURST") or "20"))
+
 # ──────────────────────────────────────────────────────────────
 # 3) Torch/device helpers + model pool
 # ──────────────────────────────────────────────────────────────
@@ -201,6 +228,25 @@ if torch is not None:
 _WHISPER_LOCK = threading.Lock()
 _WHISPER_POOL: dict[tuple[str, str], object] = {}
 _WHISPER_REFS: dict[tuple[str, str], int] = {}
+
+_SESSION_SEM = threading.BoundedSemaphore(ASR_MAX_SESSIONS)
+_TRANSCRIBE_SEM = threading.BoundedSemaphore(ASR_MAX_TRANSCRIPTS)
+_TRANSCRIBE_INFLIGHT = 0
+_TRANSCRIBE_INFLIGHT_LOCK = threading.Lock()
+
+@contextlib.contextmanager
+def _transcribe_slot(timeout: float = ASR_TRANSCRIBE_TIMEOUT_S):
+    global _TRANSCRIBE_INFLIGHT
+    if not _TRANSCRIBE_SEM.acquire(timeout=timeout):
+        raise TimeoutError("ASR transcriber at capacity")
+    with _TRANSCRIBE_INFLIGHT_LOCK:
+        _TRANSCRIBE_INFLIGHT += 1
+    try:
+        yield
+    finally:
+        with _TRANSCRIBE_INFLIGHT_LOCK:
+            _TRANSCRIBE_INFLIGHT -= 1
+        _TRANSCRIBE_SEM.release()
 
 def _get_whisper_model(name: str, device: str | None = None):
     dev = _device_or_auto(device or ASR_DEVICE)
@@ -249,13 +295,46 @@ def _model_name(m, fallback: str) -> str:
         return fallback
 
 # ──────────────────────────────────────────────────────────────
-# 4) Flask app
+# 4) Flask app + rate limiter
 # ──────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, origins=[o.strip() for o in CORS_ORIGINS.split(",")] if CORS_ORIGINS != "*" else "*")
 
-def _ok(data: dict, code=200): return (jsonify({"ok": True, **data}), code)
-def _err(msg: str, code=400):  return (jsonify({"ok": False, "error": msg}), code)
+def _ok(data: dict, code=200, headers: dict | None = None):
+    resp = jsonify({"ok": True, **data})
+    return (resp, code, headers or {})
+def _err(msg: str, code=400, headers: dict | None = None):
+    resp = jsonify({"ok": False, "error": msg})
+    return (resp, code, headers or {})
+
+# Simple token-bucket per-IP
+class _Bucket:
+    __slots__ = ("ts","tokens")
+    def __init__(self): self.ts=time.time(); self.tokens=float(ASR_RLIMIT_BURST)
+_rlock = threading.Lock()
+_buckets: dict[str,_Bucket] = {}
+
+@app.before_request
+def _before():
+    # Body guard
+    cl = request.content_length or 0
+    if cl and cl > ASR_MAX_BODY_BYTES:
+        return _err("payload too large", 413)
+
+    # Rate limit
+    ip = request.headers.get("X-Forwarded-For","").split(",")[0].strip() or request.remote_addr or "0.0.0.0"
+    now = time.time()
+    with _rlock:
+        b = _buckets.get(ip)
+        if b is None:
+            b = _Bucket(); _buckets[ip]=b
+        # refill
+        dt = max(0.0, now - b.ts); b.ts = now
+        b.tokens = min(float(ASR_RLIMIT_BURST), b.tokens + dt*ASR_RLIMIT_RPS)
+        if b.tokens < 1.0:
+            return _err("rate limit", 429, {"Retry-After":"1"})
+        b.tokens -= 1.0
+    g.client_ip = ip
 
 # ──────────────────────────────────────────────────────────────
 # 5) Audio decode helpers
@@ -286,10 +365,6 @@ def _resample_mono(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
         return y
 
 def _decode_any_to_f32(data: bytes, declared_fmt: str | None = None, sr_hint: int | None = None) -> tuple[np.ndarray, int]:
-    """
-    Decode arbitrary audio bytes to mono float32 @ 16000 Hz.
-    First tries soundfile; else ffmpeg if available.
-    """
     fmt = (declared_fmt or "").lower()
     if fmt == "pcm16":
         pcm = _pcm16_bytes_to_f32(data)
@@ -385,7 +460,8 @@ def _transcribe_preview_with(model, x_f32_16k: np.ndarray, prompt: str | None, o
     kw = dict(opts)
     if prompt:
         kw["prompt"] = str(prompt)
-    r = model.transcribe(x_f32_16k, **kw)
+    with _transcribe_slot():
+        r = model.transcribe(x_f32_16k, **kw)
     return {
         "text": (r.get("text") or "").strip(),
         "segments": _segments_to_json(r),
@@ -402,7 +478,8 @@ def _transcribe_full(x_f32_16k: np.ndarray, prompt: str | None = None) -> dict:
     kw = dict(FINAL_OPTS)
     if prompt:
         kw["prompt"] = str(prompt)
-    r = MODEL_FULL.transcribe(x_f32_16k, **kw)
+    with _transcribe_slot():
+        r = MODEL_FULL.transcribe(x_f32_16k, **kw)
     out = {
         "text": (r.get("text") or "").strip(),
         "segments": _segments_to_json(r),
@@ -448,7 +525,7 @@ def _extract_prompt_from_request(default: str | None = None) -> str | None:
     return default
 
 # ──────────────────────────────────────────────────────────────
-# 7) Streaming session (mode-aware, idle auto-finalize & debounced preview)
+# 7) Streaming session
 # ──────────────────────────────────────────────────────────────
 class StreamSession:
     def __init__(self,
@@ -458,7 +535,9 @@ class StreamSession:
                  preview_model=None,
                  preview_opts: dict | None = None,
                  win_s: float | None = None,
-                 step_s: float | None = None):
+                 step_s: float | None = None,
+                 preview_model_name: str | None = None,
+                 preview_is_custom: bool = False):
         self.id = sid
         self.prompt = (prompt or "").strip() or None
         self.mode = (mode or "fast").lower()
@@ -472,10 +551,14 @@ class StreamSession:
         self.created = time.time()
         self.last_rx = self.created
         self.done = threading.Event()
-        self.events: "queue.Queue[dict]" = queue.Queue()
+        self.events: "queue.Queue[dict]" = queue.Queue(maxsize=ASR_EVENTS_QUEUE_MAX)
+        self.preview_model_name = preview_model_name
+        self.preview_is_custom = bool(preview_is_custom and preview_model_name)
+        self._closed = False
+        self._sem_released = False
 
         # preview bookkeeping
-        self._thread = threading.Thread(target=self._preview_loop, daemon=True)
+        self._thread = threading.Thread(target=self._preview_loop, daemon=True, name=f"asr-preview-{sid}")
         self._prev_preview = ""
         self._running_text = ""
         self._last_len = 0
@@ -483,7 +566,44 @@ class StreamSession:
 
         self._thread.start()
 
+    def _enqueue_event(self, event: dict) -> None:
+        try:
+            self.events.put_nowait(event)
+            return
+        except queue.Full:
+            pass
+        if event.get("event") == "keepalive":
+            return
+        try:
+            _ = self.events.get_nowait()  # drop oldest
+        except queue.Empty:
+            pass
+        try:
+            self.events.put_nowait(event)
+        except queue.Full:
+            pass
+
+    def _release_sem_once(self) -> None:
+        if self._sem_released:
+            return
+        self._sem_released = True
+        with contextlib.suppress(ValueError):
+            _SESSION_SEM.release()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.done.set()
+        if self.preview_is_custom and self.preview_model_name:
+            _release_whisper_model(self.preview_model_name, ASR_DEVICE)
+        self._release_sem_once()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
     def append_pcm16(self, data: bytes, sr: int):
+        if self.done.is_set():
+            raise RuntimeError("session already finalized")
         x = _pcm16_bytes_to_f32(data)
         with self.lock:
             if sr != 16000:
@@ -496,6 +616,8 @@ class StreamSession:
         return len(x) / 16000.0
 
     def append_any(self, data: bytes, fmt: str | None = None, sr_hint: int | None = None):
+        if self.done.is_set():
+            raise RuntimeError("session already finalized")
         x, _ = _decode_any_to_f32(data, fmt, sr_hint)
         with self.lock:
             self.buf = np.concatenate((self.buf, x))
@@ -524,28 +646,28 @@ class StreamSession:
                             self.finalize()
                         except Exception:
                             pass
-                    self.events.put({"event":"keepalive", "ts": int(now*1000)})
+                    self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
                 # 2) Debounce preview unless NEW audio since last tick
                 if last_change_age < self.step_s * 0.6:  # a bit less than cadence
-                    self.events.put({"event":"keepalive", "ts": int(now*1000)})
+                    self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
                 if x.size == 0:
-                    self.events.put({"event":"keepalive", "ts": int(now*1000)})
+                    self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
                 r = _transcribe_preview_with(self.preview_model, x, self.prompt, self.preview_opts)
                 preview_text = r.get("text","").strip()
                 if not preview_text:
-                    self.events.put({"event":"keepalive", "ts": int(now*1000)})
+                    self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
                 new_suffix = _diff_new_suffix(self._prev_preview, preview_text)
                 if new_suffix:
                     self._running_text = (self._running_text + " " + new_suffix).strip()
-                    self.events.put({
+                    self._enqueue_event({
                         "event":"asr.partial",
                         "id": self.id,
                         "text": self._running_text,
@@ -554,19 +676,16 @@ class StreamSession:
                         "ts": int(now*1000),
                     })
                 else:
-                    self.events.put({"event":"keepalive", "ts": int(now*1000)})
+                    self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
 
                 self._prev_preview = preview_text
             except Exception:
-                self.events.put({"event":"keepalive", "ts": int(time.time()*1000)})
+                self._enqueue_event({"event":"keepalive", "ts": int(time.time()*1000)})
 
     def finalize(self) -> dict:
-        if self.done.is_set():
-            # already finalized; still produce a result from current buf snapshot
-            pass
-        self.done.set()
         with self.lock:
             x = self.buf.copy()
+        self.done.set()
         final = _transcribe_full(x, prompt=self.prompt)
         result = {
             "ok": True,
@@ -584,7 +703,7 @@ class StreamSession:
         if "words" in final:
             result["words"] = final["words"]
         try:
-            self.events.put({"event":"asr.final", "id": self.id, "result": result, "ts": int(time.time()*1000)})
+            self._enqueue_event({"event":"asr.final", "id": self.id, "result": result, "ts": int(time.time()*1000)})
         except Exception:
             pass
         return result
@@ -600,7 +719,8 @@ def _get_session_or_404(sid: str) -> StreamSession | None:
     with _SESS_LOCK:
         return _SESSIONS.get(sid)
 
-def _create_session(*, prompt: str | None, mode: str, preview_model, preview_opts: dict, win_s: float, step_s: float) -> StreamSession:
+def _create_session(*, prompt: str | None, mode: str, preview_model, preview_opts: dict,
+                    win_s: float, step_s: float, preview_model_name: str | None, preview_is_custom: bool) -> StreamSession:
     sid = _new_session_id()
     sess = StreamSession(sid,
                          prompt=prompt,
@@ -608,7 +728,9 @@ def _create_session(*, prompt: str | None, mode: str, preview_model, preview_opt
                          preview_model=preview_model,
                          preview_opts=preview_opts,
                          win_s=win_s,
-                         step_s=step_s)
+                         step_s=step_s,
+                         preview_model_name=preview_model_name,
+                         preview_is_custom=preview_is_custom)
     with _SESS_LOCK:
         _SESSIONS[sid] = sess
     return sess
@@ -620,7 +742,7 @@ def _gc_sessions():
             idle = now - max(sess.last_rx, sess.created)
             if idle > SESSION_TTL_S:
                 try:
-                    sess.done.set()
+                    sess.close()
                 except Exception:
                     pass
                 del _SESSIONS[sid]
@@ -629,7 +751,7 @@ def _gc_loop():
     while True:
         time.sleep(15)
         _gc_sessions()
-threading.Thread(target=_gc_loop, daemon=True).start()
+threading.Thread(target=_gc_loop, daemon=True, name="asr-gc").start()
 
 # ──────────────────────────────────────────────────────────────
 # 8) Routes
@@ -650,6 +772,21 @@ def health():
             "fast": {"window_s": FAST_WIN_S, "step_s": FAST_STEP_S, "model": FAST_MODEL_PREV},
             "accurate": {"window_s": ACC_WIN_S, "step_s": ACC_STEP_S, "model": ACC_MODEL_PREV},
         }
+    })
+
+@app.get("/metrics")
+def metrics():
+    with _SESS_LOCK:
+        n_sessions = len(_SESSIONS)
+        qsizes = [s.events.qsize() for s in _SESSIONS.values()]
+    with _TRANSCRIBE_INFLIGHT_LOCK:
+        inflight = _TRANSCRIBE_INFLIGHT
+    return _ok({
+        "active_sessions": n_sessions,
+        "sessions_capacity": ASR_MAX_SESSIONS,
+        "events_queue_sizes": qsizes,
+        "transcribe_inflight": inflight,
+        "transcribe_capacity": ASR_MAX_TRANSCRIPTS
     })
 
 @app.get("/models")
@@ -708,11 +845,16 @@ def recognize_file():
             "words": r.get("words"),
         }
         return _ok(out)
+    except TimeoutError as e:
+        return _err(str(e), 429, {"Retry-After":"2"})
     except Exception as e:
         return _err(f"{type(e).__name__}: {e}", 500)
 
 @app.post("/recognize/stream/start")
 def stream_start():
+    # Capacity admission
+    if not _SESSION_SEM.acquire(timeout=ASR_SESSION_ACQUIRE_TIMEOUT_S):
+        return _err("asr at capacity", 429, {"Retry-After":"2"})
     payload = request.get_json(silent=True) or {}
     prompt = _extract_prompt_from_request()
     mode = (request.args.get("mode") or payload.get("mode") or MODE_DEFAULT).strip().lower()
@@ -725,6 +867,7 @@ def stream_start():
     # preview model override by name (optional)
     model_name = (request.args.get("preview_model") or payload.get("preview_model") or
                   (FAST_MODEL_PREV if mode=="fast" else ACC_MODEL_PREV)).strip()
+    is_custom = model_name not in (FAST_MODEL_PREV, ACC_MODEL_PREV)
     if model_name == FAST_MODEL_PREV:
         preview_model = MODEL_FAST_PREVIEW
     elif model_name == ACC_MODEL_PREV:
@@ -739,7 +882,9 @@ def stream_start():
                            preview_model=preview_model,
                            preview_opts=preview_opts,
                            win_s=win_s,
-                           step_s=step_s)
+                           step_s=step_s,
+                           preview_model_name=model_name,
+                           preview_is_custom=is_custom)
 
     return _ok({
         "id": sess.id,
@@ -762,12 +907,16 @@ def stream_audio(sid: str):
         data = request.get_data()
         if not data:
             return _err("empty body")
+        if len(data) > ASR_MAX_BODY_BYTES:
+            return _err("payload too large", 413)
         if fmt == "pcm16":
             secs = sess.append_pcm16(data, sr)
         else:
             secs = sess.append_any(data, fmt, sr)
         total = len(sess.buf) / 16000.0
         return _ok({"received": len(data), "seconds": float(secs), "total_seconds": float(total)})
+    except TimeoutError as e:
+        return _err(str(e), 429, {"Retry-After":"2"})
     except Exception as e:
         return _err(f"{type(e).__name__}: {e}", 500)
 
@@ -778,6 +927,9 @@ def stream_end(sid: str):
         return _err("unknown session", 404)
     try:
         final = sess.finalize()
+        sess.close()
+        with _SESS_LOCK:
+            _SESSIONS.pop(sid, None)
         return _ok({"final": final})
     except Exception as e:
         return _err(f"{type(e).__name__}: {e}", 500)
@@ -790,7 +942,6 @@ def stream_events(sid: str):
 
     @stream_with_context
     def _gen():
-        # Initial hello
         yield "event: keepalive\n"
         yield f"data: {json.dumps({'ts': int(time.time()*1000)})}\n\n"
         idle = 0
@@ -808,12 +959,21 @@ def stream_events(sid: str):
                 yield f"data: {json.dumps({'ts': int(time.time()*1000)})}\n\n"
                 if idle > SESSION_TTL_S:
                     break
+        # close session after streaming final or TTL idle
+        try:
+            sess.close()
+        finally:
+            with _SESS_LOCK:
+                _SESSIONS.pop(sid, None)
 
     return Response(_gen(), mimetype="text/event-stream")
 
 # ──────────────────────────────────────────────────────────────
-# 9) Main
+# 9) Main (production WSGI default)
 # ──────────────────────────────────────────────────────────────
+def create_app():
+    return app
+
 if __name__ == "__main__":
     dev = _device_or_auto(ASR_DEVICE)
     print(f"[ASR] device={dev}")
@@ -823,4 +983,10 @@ if __name__ == "__main__":
     print(f"[ASR] modes: default={MODE_DEFAULT}  fast(win={FAST_WIN_S}s,step={FAST_STEP_S}s)  "
           f"accurate(win={ACC_WIN_S}s,step={ACC_STEP_S}s)")
     print(f"[ASR] http://{ASR_HOST}:{ASR_PORT}")
-    app.run(host=ASR_HOST, port=ASR_PORT, threaded=True)
+    try:
+        from waitress import serve
+        serve(app, host=ASR_HOST, port=ASR_PORT, threads=max(8, ASR_MAX_TRANSCRIPTS*4))
+    except Exception as e:
+        print(f"[ASR] waitress failed: {e}; falling back to Flask dev server", file=sys.stderr)
+        from werkzeug.serving import run_simple
+        run_simple(ASR_HOST, ASR_PORT, app, threaded=True)
