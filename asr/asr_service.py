@@ -23,7 +23,7 @@ Routes:
   GET  /recognize/stream/<sid>/events
 """
 
-import os, sys, json, time, base64, threading, queue, subprocess, shutil
+import os, sys, json, time, base64, threading, queue, subprocess, shutil, logging
 import contextlib
 from pathlib import Path
 
@@ -71,6 +71,16 @@ if not _in_venv():
     _ensure_venv()
     os.execv(str(PY), [str(PY), *sys.argv])
 _ensure_deps()
+
+# ──────────────────────────────────────────────────────────────
+# Logging setup
+# ──────────────────────────────────────────────────────────────
+LOG_LEVEL = os.environ.get("ASR_LOG_LEVEL", "DEBUG").upper()
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                        format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
+LOG = logging.getLogger("whisper_asr.service")
+LOG.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # ──────────────────────────────────────────────────────────────
 # 1) imports (post-venv)
@@ -180,6 +190,7 @@ CR_THRESH         = float(_cfg.get("ASR_COMPRESSION_RATIO_THRESHOLD") or "2.4")
 # Runtime
 SESSION_TTL_S     = int(_cfg.get("ASR_SESSION_TTL_S") or "900")
 AUTO_FINALIZE_S   = float(_cfg.get("ASR_AUTO_FINALIZE_S") or "1.4")
+STREAM_PHRASE_TIMEOUT = float(_cfg.get("ASR_STREAM_PHRASE_TIMEOUT") or "2.2")
 FP16_MODE         = (_cfg.get("ASR_FP16") or "auto").strip().lower()    # auto|true|false
 TORCH_THREADS     = int(_cfg.get("ASR_TORCH_THREADS") or "0")
 
@@ -198,20 +209,96 @@ ASR_RLIMIT_BURST = max(1, int(_cfg.get("ASR_RLIMIT_BURST") or "20"))
 # ──────────────────────────────────────────────────────────────
 # 3) Torch/device helpers + model pool
 # ──────────────────────────────────────────────────────────────
-def _torch_has_cuda() -> bool:
+
+def _detect_cuda_devices():
+    devices: list[dict[str, object]] = []
+    unusable: list[str] = []
+    if torch is None:
+        return devices, unusable
     try:
-        return bool(torch and torch.cuda.is_available())
-    except Exception:
-        return False
+        if not torch.cuda.is_available():
+            return devices, unusable
+    except Exception as exc:
+        unusable.append(f"cuda availability check failed: {exc}")
+        return [], unusable
+
+    try:
+        arch_list = []
+        with contextlib.suppress(Exception):
+            arch_list = torch.cuda.get_arch_list()
+        compiled_sms = set()
+        for arch in arch_list:
+            if isinstance(arch, str) and arch.startswith("sm_"):
+                with contextlib.suppress(ValueError):
+                    compiled_sms.add(int(arch.split("_")[1]))
+
+        for idx in range(torch.cuda.device_count()):
+            try:
+                name = torch.cuda.get_device_name(idx)
+                major, minor = torch.cuda.get_device_capability(idx)
+                sm = major * 10 + minor
+            except Exception as exc:
+                unusable.append(f"cuda:{idx} query failed: {exc}")
+                continue
+
+            if compiled_sms and sm not in compiled_sms and sm < min(compiled_sms):
+                unusable.append(f"cuda:{idx} {name} sm_{sm} not in supported arch list {sorted(compiled_sms)}")
+                continue
+
+            try:
+                torch.zeros(1, device=f"cuda:{idx}")
+            except Exception as exc:
+                unusable.append(f"cuda:{idx} {name} unusable: {exc}")
+                continue
+
+            devices.append({"id": idx, "name": name, "sm": sm})
+    except Exception as exc:
+        unusable.append(f"cuda device scan failed: {exc}")
+    return devices, unusable
+
+
+_CUDA_DEVICES, _CUDA_UNUSABLE = _detect_cuda_devices()
+_WARNED_INVALID_DEVICE = False
+
+if _CUDA_DEVICES:
+    summary = ", ".join(f"cuda:{d['id']} {d['name']} (sm_{int(d['sm'])})" for d in _CUDA_DEVICES)
+    print(f"[ASR] CUDA devices: {summary}")
+if _CUDA_UNUSABLE:
+    for msg in _CUDA_UNUSABLE:
+        print(f"[ASR] cuda warning: {msg}")
+
+def _torch_has_cuda() -> bool:
+    return bool(_CUDA_DEVICES)
 
 def _device_or_auto(dev: str | None) -> str:
+    global _WARNED_INVALID_DEVICE
     if not dev or dev == "auto":
-        return "cuda" if _torch_has_cuda() else "cpu"
-    if dev not in ("cpu", "cuda"):
-        return "cuda" if _torch_has_cuda() else "cpu"
-    if dev == "cuda" and not _torch_has_cuda():
+        return f"cuda:{_CUDA_DEVICES[0]['id']}" if _CUDA_DEVICES else "cpu"
+
+    dev = dev.strip().lower()
+    if dev == "cpu":
         return "cpu"
-    return dev
+
+    if dev.startswith("cuda"):
+        # Allow cuda or cuda:<idx>
+        if dev == "cuda":
+            return f"cuda:{_CUDA_DEVICES[0]['id']}" if _CUDA_DEVICES else "cpu"
+        parts = dev.split(":", 1)
+        if len(parts) == 2:
+            try:
+                idx = int(parts[1])
+                if any(d["id"] == idx for d in _CUDA_DEVICES):
+                    return f"cuda:{idx}"
+            except ValueError:
+                pass
+        if _CUDA_DEVICES:
+            return f"cuda:{_CUDA_DEVICES[0]['id']}"
+        if not _WARNED_INVALID_DEVICE:
+            print(f"[ASR] requested device '{dev}' not available, falling back to CPU")
+            _WARNED_INVALID_DEVICE = True
+        return "cpu"
+
+    return "cpu"
 
 # Perf hints
 if torch is not None:
@@ -563,6 +650,12 @@ class StreamSession:
         self._running_text = ""
         self._last_len = 0
         self._last_len_change_ts = time.time()
+        self._last_partial_emit_ts = 0.0
+        self._partial_marked_final = False
+        self._partial_final_after = max(0.45, min(AUTO_FINALIZE_S * 0.5 if AUTO_FINALIZE_S else 0.8, 1.5))
+        self._partial_silence_rms = 0.012
+        self._phrase_timeout = STREAM_PHRASE_TIMEOUT
+        self._partial_seq = 0
 
         self._thread.start()
 
@@ -601,6 +694,17 @@ class StreamSession:
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
+    def _should_emit_partial_final(self, last_change_age: float, tail_rms: float) -> bool:
+        if self._partial_marked_final:
+            return False
+        if not self._running_text:
+            return False
+        if last_change_age < self._partial_final_after:
+            return False
+        if tail_rms > self._partial_silence_rms:
+            return False
+        return True
+
     def append_pcm16(self, data: bytes, sr: int):
         if self.done.is_set():
             raise RuntimeError("session already finalized")
@@ -608,23 +712,29 @@ class StreamSession:
         with self.lock:
             if sr != 16000:
                 x = _resample_mono(x, sr, 16000)
+            rms = float(np.sqrt(np.mean(x ** 2))) if x.size else 0.0
+            LOG.debug("session %s: chunk %d samples (sr=%d, rms=%.4f)", self.id, len(x), sr, rms)
             self.buf = np.concatenate((self.buf, x))
             self.last_rx = time.time()
             if len(self.buf) != self._last_len:
                 self._last_len = len(self.buf)
                 self._last_len_change_ts = self.last_rx
+            self._partial_marked_final = False
         return len(x) / 16000.0
 
     def append_any(self, data: bytes, fmt: str | None = None, sr_hint: int | None = None):
         if self.done.is_set():
             raise RuntimeError("session already finalized")
-        x, _ = _decode_any_to_f32(data, fmt, sr_hint)
+        x, sr = _decode_any_to_f32(data, fmt, sr_hint)
         with self.lock:
+            rms = float(np.sqrt(np.mean(x ** 2))) if x.size else 0.0
+            LOG.debug("session %s: chunk %d samples (%s, sr=%s, rms=%.4f)", self.id, len(x), fmt or 'raw', sr or 'auto', rms)
             self.buf = np.concatenate((self.buf, x))
             self.last_rx = time.time()
             if len(self.buf) != self._last_len:
                 self._last_len = len(self.buf)
                 self._last_len_change_ts = self.last_rx
+            self._partial_marked_final = False
         return len(x) / 16000.0
 
     def _preview_loop(self):
@@ -638,6 +748,9 @@ class StreamSession:
                     x = self.buf[-tail_len:].copy()
                     buf_len = len(self.buf)
                     last_change_age = now - self._last_len_change_ts
+                    tail_rms = float(np.sqrt(np.mean(x ** 2))) if x.size else 0.0
+
+                phrase_gap = now - (self._last_partial_emit_ts or self.created)
 
                 # 1) Auto-finalize if no new audio for AUTO_FINALIZE_S
                 if AUTO_FINALIZE_S > 0 and last_change_age >= AUTO_FINALIZE_S:
@@ -649,12 +762,26 @@ class StreamSession:
                     self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
-                # 2) Debounce preview unless NEW audio since last tick
-                if last_change_age < self.step_s * 0.6:  # a bit less than cadence
-                    self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
-                    continue
-
                 if x.size == 0:
+                    if (self._running_text and not self._partial_marked_final and
+                            phrase_gap >= self._phrase_timeout):
+                        self._partial_marked_final = True
+                        self._partial_seq += 1
+                        self._last_partial_emit_ts = now
+                        payload = {
+                            "event": "asr.partial",
+                            "id": self.id,
+                            "text": self._running_text,
+                            "words_added": "",
+                            "mode": self.mode,
+                            "final": True,
+                            "gap_ms": int(phrase_gap * 1000),
+                            "tail_rms": 0.0,
+                            "seq": self._partial_seq,
+                            "ts": int(now * 1000),
+                        }
+                        self._enqueue_event(payload)
+                        LOG.info("session %s: forced partial finalize text='%s' gap=%.2fs", self.id, self._running_text[-80:], phrase_gap)
                     self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
                     continue
 
@@ -666,18 +793,51 @@ class StreamSession:
 
                 new_suffix = _diff_new_suffix(self._prev_preview, preview_text)
                 if new_suffix:
-                    self._running_text = (self._running_text + " " + new_suffix).strip()
+                    if phrase_gap >= self._phrase_timeout:
+                        self._running_text = new_suffix.strip()
+                    else:
+                        self._running_text = (self._running_text + " " + new_suffix).strip()
+                    self._last_partial_emit_ts = now
+                    self._partial_marked_final = False
+                    self._partial_seq += 1
                     self._enqueue_event({
-                        "event":"asr.partial",
+                        "event": "asr.partial",
                         "id": self.id,
                         "text": self._running_text,
                         "words_added": new_suffix,
                         "mode": self.mode,
-                        "ts": int(now*1000),
+                        "final": False,
+                        "gap_ms": int(last_change_age * 1000),
+                        "tail_rms": tail_rms,
+                        "seq": self._partial_seq,
+                        "ts": int(now * 1000),
                     })
-                else:
-                    self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
+                    LOG.debug("session %s: partial update final=%s text='%s'", self.id, False, self._running_text[-80:])
+                    self._prev_preview = preview_text
+                    continue
 
+                if self._should_emit_partial_final(last_change_age, tail_rms):
+                    self._partial_marked_final = True
+                    self._partial_seq += 1
+                    self._last_partial_emit_ts = now
+                    payload = {
+                        "event": "asr.partial",
+                        "id": self.id,
+                        "text": self._running_text,
+                        "words_added": "",
+                        "mode": self.mode,
+                        "final": True,
+                        "gap_ms": int(last_change_age * 1000),
+                        "tail_rms": tail_rms,
+                        "seq": self._partial_seq,
+                        "ts": int(now * 1000),
+                    }
+                    self._enqueue_event(payload)
+                    LOG.info("session %s: partial stabilized text='%s' gap=%.2fs rms=%.4f", self.id, self._running_text[-80:], last_change_age, tail_rms)
+                    self._prev_preview = preview_text
+                    continue
+
+                self._enqueue_event({"event":"keepalive", "ts": int(now*1000)})
                 self._prev_preview = preview_text
             except Exception:
                 self._enqueue_event({"event":"keepalive", "ts": int(time.time()*1000)})
@@ -702,6 +862,12 @@ class StreamSession:
         }
         if "words" in final:
             result["words"] = final["words"]
+        final_text = result.get("text") or ""
+        snippet = final_text.strip()[:120]
+        LOG.info("session %s: finalized transcript (%d chars, duration=%.2fs) text='%s'", self.id, len(final_text), result.get("duration") or 0.0, snippet)
+        self._running_text = ""
+        self._partial_marked_final = False
+        self._last_partial_emit_ts = time.time()
         try:
             self._enqueue_event({"event":"asr.final", "id": self.id, "result": result, "ts": int(time.time()*1000)})
         except Exception:
