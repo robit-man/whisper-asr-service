@@ -23,7 +23,7 @@ Routes:
   GET  /recognize/stream/<sid>/events
 """
 
-import os, sys, json, time, base64, threading, queue, subprocess, shutil, logging
+import os, sys, json, time, base64, threading, queue, subprocess, shutil, logging, ssl
 import contextlib
 from pathlib import Path
 
@@ -35,6 +35,83 @@ VENV = BASE / ".venv"
 BIN  = VENV / ("Scripts" if os.name == "nt" else "bin")
 PY   = BIN / ("python.exe" if os.name == "nt" else "python")
 PIP  = BIN / ("pip.exe" if os.name == "nt" else "pip")
+
+_TLS_CONFIG = {
+    "bundle": None,   # type: str | None
+    "disabled": False,
+    "explicit": False,
+}
+
+def _env_truthy(val: str | None) -> bool:
+    if not val:
+        return False
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+def _configure_tls_trust():
+    """
+    Configure a CA bundle so HTTPS downloads work on non-Debian distros or custom envs.
+    """
+    global _TLS_CONFIG
+
+    if _env_truthy(os.environ.get("ASR_SSL_NO_VERIFY")):
+        try:
+            ssl._create_default_https_context = ssl._create_unverified_context
+            _TLS_CONFIG["disabled"] = True
+            print("[ASR] WARNING: TLS verification disabled via ASR_SSL_NO_VERIFY=1", file=sys.stderr)
+        except Exception:
+            pass
+        return
+
+    ca_hint = os.environ.get("ASR_SSL_CA_BUNDLE")
+    if ca_hint:
+        hint_path = Path(ca_hint).expanduser()
+        if hint_path.exists():
+            os.environ.setdefault("SSL_CERT_FILE", str(hint_path))
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", str(hint_path))
+            os.environ.setdefault("PIP_CERT", str(hint_path))
+            _TLS_CONFIG["bundle"] = str(hint_path)
+            _TLS_CONFIG["explicit"] = True
+            try:
+                ssl._create_default_https_context = lambda *args, **kwargs: ssl.create_default_context(cafile=str(hint_path))
+            except Exception:
+                pass
+            return
+        else:
+            print(f"[ASR] warning: ASR_SSL_CA_BUNDLE={hint_path} does not exist", file=sys.stderr)
+
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("PIP_CERT"):
+        current = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("PIP_CERT")
+        _TLS_CONFIG["bundle"] = current
+        _TLS_CONFIG["explicit"] = True
+        return
+
+    candidates: list[Path] = []
+    with contextlib.suppress(Exception):
+        import certifi  # type: ignore
+        candidates.append(Path(certifi.where()))
+
+    candidates.extend([
+        Path("/etc/ssl/certs/ca-certificates.crt"),      # Debian/Ubuntu
+        Path("/etc/pki/tls/certs/ca-bundle.crt"),        # RHEL/CentOS/Fedora
+        Path("/etc/ssl/ca-bundle.pem"),                  # SLES/openSUSE
+        Path("/etc/ssl/cert.pem"),                       # Alpine, macOS python.org builds
+        Path("/usr/local/etc/openssl/cert.pem"),         # Homebrew OpenSSL
+        Path("/System/Library/OpenSSL/certs/cert.pem"),  # Older macOS
+    ])
+
+    for cand in candidates:
+        if cand and cand.exists():
+            os.environ.setdefault("SSL_CERT_FILE", str(cand))
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", str(cand))
+            os.environ.setdefault("PIP_CERT", str(cand))
+            _TLS_CONFIG["bundle"] = str(cand)
+            try:
+                ssl._create_default_https_context = lambda *args, **kwargs: ssl.create_default_context(cafile=str(cand))
+            except Exception:
+                pass
+            break
+
+_configure_tls_trust()
 
 def _in_venv() -> bool:
     try:
@@ -321,6 +398,24 @@ _TRANSCRIBE_SEM = threading.BoundedSemaphore(ASR_MAX_TRANSCRIPTS)
 _TRANSCRIBE_INFLIGHT = 0
 _TRANSCRIBE_INFLIGHT_LOCK = threading.Lock()
 
+def _is_tls_cert_error(exc: Exception | None) -> bool:
+    if exc is None:
+        return False
+    import urllib.error
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    if isinstance(exc, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(exc):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return _is_tls_cert_error(getattr(exc, "reason", None))
+    cause = getattr(exc, "__cause__", None)
+    if cause and cause is not exc and _is_tls_cert_error(cause):
+        return True
+    ctx = getattr(exc, "__context__", None)
+    if ctx and ctx is not exc and _is_tls_cert_error(ctx):
+        return True
+    return False
+
 @contextlib.contextmanager
 def _transcribe_slot(timeout: float = ASR_TRANSCRIBE_TIMEOUT_S):
     global _TRANSCRIBE_INFLIGHT
@@ -342,7 +437,20 @@ def _get_whisper_model(name: str, device: str | None = None):
         if key in _WHISPER_POOL:
             _WHISPER_REFS[key] += 1
             return _WHISPER_POOL[key]
-        m = whisper.load_model(name, device=dev)
+        try:
+            m = whisper.load_model(name, device=dev)
+        except Exception as exc:
+            if _is_tls_cert_error(exc):
+                hint_parts = ["failed to download Whisper model due to TLS certificate verification error."]
+                if _TLS_CONFIG["disabled"]:
+                    hint_parts.append("Certificate checks are disabled (ASR_SSL_NO_VERIFY); the remote certificate may be untrusted.")
+                elif _TLS_CONFIG["explicit"]:
+                    bundle = _TLS_CONFIG["bundle"] or "custom SSL_CERT_FILE/REQUESTS_CA_BUNDLE"
+                    hint_parts.append(f"Verify the bundle at {bundle} trusts the issuer.")
+                else:
+                    hint_parts.append("Set ASR_SSL_CA_BUNDLE to your CA bundle path or, as a last resort, ASR_SSL_NO_VERIFY=1.")
+                raise RuntimeError(" ".join(hint_parts)) from exc
+            raise
         _WHISPER_POOL[key] = m
         _WHISPER_REFS[key] = 1
         return m
